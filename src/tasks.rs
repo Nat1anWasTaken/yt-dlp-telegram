@@ -244,10 +244,7 @@ mod tests {
     fn callback_roundtrip() {
         let id = TaskId::from_raw("task123");
         let data = build_task_callback(&id, "140");
-        assert_eq!(
-            parse_task_callback(&data),
-            Some((id, "140".to_string()))
-        );
+        assert_eq!(parse_task_callback(&data), Some((id, "140".to_string())));
     }
 
     #[test]
