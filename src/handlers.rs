@@ -66,7 +66,7 @@ pub struct AppServices {
     state: AppState,
     media: Arc<dyn MediaProvider>,
     downloader: Arc<dyn Downloader>,
-    allowed_user_ids: Option<HashSet<i64>>,
+    allowed_user_ids: Option<HashSet<u64>>,
 }
 
 impl AppServices {
@@ -81,7 +81,7 @@ impl AppServices {
     }
 }
 
-fn read_allowed_user_ids() -> Option<HashSet<i64>> {
+fn read_allowed_user_ids() -> Option<HashSet<u64>> {
     let raw = env::var("ALLOWED_USER_IDS").ok()?;
     let mut ids = HashSet::new();
     for entry in raw.split(',') {
@@ -89,7 +89,7 @@ fn read_allowed_user_ids() -> Option<HashSet<i64>> {
         if trimmed.is_empty() {
             continue;
         }
-        match trimmed.parse::<i64>() {
+        match trimmed.parse::<u64>() {
             Ok(id) => {
                 ids.insert(id);
             }
@@ -101,14 +101,14 @@ fn read_allowed_user_ids() -> Option<HashSet<i64>> {
     if ids.is_empty() { None } else { Some(ids) }
 }
 
-fn is_user_allowed(allowed_user_ids: &Option<HashSet<i64>>, user_id: i64) -> bool {
+fn is_user_allowed(allowed_user_ids: &Option<HashSet<u64>>, user_id: u64) -> bool {
     allowed_user_ids
         .as_ref()
         .map(|allowed| allowed.contains(&user_id))
         .unwrap_or(true)
 }
 
-async fn reject_user(bot: &Bot, chat_id: ChatId, user_id: i64) -> Result<(), AppError> {
+async fn reject_user(bot: &Bot, chat_id: ChatId, user_id: u64) -> Result<(), AppError> {
     bot.send_message(
         chat_id,
         format!("you don't have permission to use this, here's your user id: {user_id}"),
@@ -246,10 +246,10 @@ fn extract_non_url(msg: Message) -> Option<Message> {
     }
 }
 
-fn message_user_id(msg: &Message) -> i64 {
+fn message_user_id(msg: &Message) -> u64 {
     msg.from()
         .map(|user| user.id.0)
-        .unwrap_or_else(|| msg.chat.id.0)
+        .unwrap_or_else(|| u64::try_from(msg.chat.id.0).unwrap_or_default())
 }
 
 async fn handle_url(
