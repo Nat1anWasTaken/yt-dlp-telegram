@@ -49,25 +49,52 @@ impl fmt::Display for TaskId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MediaKind {
+    Video,
+    Audio,
+    Image,
+    Unknown,
+}
+
 #[derive(Clone, Debug)]
 pub struct FormatMeta {
     pub ext: Option<String>,
+    pub kind: MediaKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FormatSelection {
     pub format_id: String,
     pub ext: Option<String>,
+    pub kind: MediaKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TargetFormat {
+    pub ext: String,
 }
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum TaskState {
     WaitingFormat { formats: HashMap<String, FormatMeta> },
-    PendingDownload { selection: FormatSelection },
-    Downloading { selection: FormatSelection },
-    Converting { selection: FormatSelection },
-    Uploading { selection: FormatSelection },
+    SelectingTarget {
+        selection: FormatSelection,
+        targets: Vec<TargetFormat>,
+    },
+    Downloading {
+        selection: FormatSelection,
+        target: TargetFormat,
+    },
+    Converting {
+        selection: FormatSelection,
+        target: TargetFormat,
+    },
+    Uploading {
+        selection: FormatSelection,
+        target: TargetFormat,
+    },
     Finished { outcome: TaskOutcome },
 }
 
@@ -84,6 +111,7 @@ pub struct DownloadTask {
     pub message_id: MessageId,
     pub url: String,
     pub title: Option<String>,
+    pub author: Option<String>,
     pub state: TaskState,
 }
 
@@ -93,6 +121,7 @@ impl DownloadTask {
         message_id: MessageId,
         url: String,
         title: Option<String>,
+        author: Option<String>,
         formats: HashMap<String, FormatMeta>,
     ) -> Self {
         Self {
@@ -101,6 +130,7 @@ impl DownloadTask {
             message_id,
             url,
             title,
+            author,
             state: TaskState::WaitingFormat { formats },
         }
     }
@@ -167,6 +197,23 @@ pub fn parse_task_callback(data: &str) -> Option<(TaskId, String)> {
     Some((TaskId::from_raw(task_id), format_id.to_string()))
 }
 
+const TARGET_CALLBACK_PREFIX: &str = "target:";
+
+pub fn build_target_callback(id: &TaskId, ext: &str) -> String {
+    format!("{TARGET_CALLBACK_PREFIX}{}:{ext}", id.as_str())
+}
+
+pub fn parse_target_callback(data: &str) -> Option<(TaskId, String)> {
+    let payload = data.strip_prefix(TARGET_CALLBACK_PREFIX)?;
+    let mut parts = payload.splitn(2, ':');
+    let task_id = parts.next()?.trim();
+    let ext = parts.next()?.trim();
+    if task_id.is_empty() || ext.is_empty() {
+        return None;
+    }
+    Some((TaskId::from_raw(task_id), ext.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,8 +231,21 @@ mod tests {
     fn registry_insert_get_remove() {
         let registry = TaskRegistry::new();
         let mut formats = HashMap::new();
-        formats.insert("18".to_string(), FormatMeta { ext: Some("mp4".into()) });
-        let task = DownloadTask::new(ChatId(1), MessageId(1), "http://example.com".into(), None, formats);
+        formats.insert(
+            "18".to_string(),
+            FormatMeta {
+                ext: Some("mp4".into()),
+                kind: MediaKind::Video,
+            },
+        );
+        let task = DownloadTask::new(
+            ChatId(1),
+            MessageId(1),
+            "http://example.com".into(),
+            None,
+            None,
+            formats,
+        );
         let id = task.id.clone();
         registry.insert(task);
         assert!(registry.get(&id).is_some());
@@ -196,7 +256,14 @@ mod tests {
     #[tokio::test]
     async fn guard_removes_on_drop() {
         let registry = TaskRegistry::new();
-        let task = DownloadTask::new(ChatId(1), MessageId(1), "http://example.com".into(), None, HashMap::new());
+        let task = DownloadTask::new(
+            ChatId(1),
+            MessageId(1),
+            "http://example.com".into(),
+            None,
+            None,
+            HashMap::new(),
+        );
         let id = task.id.clone();
         registry.insert(task);
         {

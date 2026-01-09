@@ -23,6 +23,9 @@ pub enum AppError {
     #[error("Download failed with exit code: {0}")]
     DownloadFailed(std::process::ExitStatus),
 
+    #[error("ffmpeg failed with exit code: {0}")]
+    FfmpegFailed(std::process::ExitStatus),
+
     #[error("Task join error: {0}")]
     JoinError(#[from] tokio::task::JoinError),
 }

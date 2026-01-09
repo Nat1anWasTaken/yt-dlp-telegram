@@ -118,13 +118,11 @@ async fn download_with_progress(req: DownloadRequest) -> Result<DownloadResult, 
         return Err(AppError::DownloadFailed(status));
     }
 
-    let filename = crate::handlers::build_filename(req.title, req.ext, &req.format_id);
     if let Some(path) = temp_path {
-        Ok(DownloadResult::TempFile { path, filename })
+        Ok(DownloadResult::TempFile { path })
     } else {
         Ok(DownloadResult::InMemory {
             data: buffer.to_vec(),
-            filename,
         })
     }
 }
