@@ -1,11 +1,11 @@
 use crate::error::AppError;
 use crate::tasks::{
-    build_cancel_callback, build_target_callback, build_task_callback, parse_cancel_callback,
-    parse_target_callback, parse_task_callback, DownloadTask, FormatMeta, FormatSelection, MediaKind,
-    TargetFormat, TaskId, TaskOutcome, TaskRegistry, TaskState,
+    DownloadTask, FormatMeta, FormatSelection, MediaKind, TargetFormat, TaskId, TaskOutcome,
+    TaskRegistry, TaskState, build_cancel_callback, build_target_callback, build_task_callback,
+    parse_cancel_callback, parse_target_callback, parse_task_callback,
 };
 use crate::yt_dlp::{Downloader, MediaProvider, YtDlpClient};
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{Rng, distributions::Alphanumeric};
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -13,16 +13,16 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 use teloxide::{
+    ApiError, RequestError,
     dispatching::DpHandlerDescription,
     prelude::*,
     types::{InlineKeyboardButton, InlineKeyboardMarkup, InputFile, MessageId},
-    ApiError, RequestError,
 };
 use tokio::{io::AsyncReadExt, process::Command, sync::Mutex, time};
 use tracing::warn;
@@ -54,7 +54,9 @@ struct AppState {
 
 impl Default for AppState {
     fn default() -> Self {
-        Self { tasks: TaskRegistry::new() }
+        Self {
+            tasks: TaskRegistry::new(),
+        }
     }
 }
 
@@ -171,9 +173,14 @@ struct RunDownloadContext {
     cancel: Arc<AtomicBool>,
 }
 
-pub fn build_handler() -> Handler<'static, DependencyMap, Result<(), AppError>, DpHandlerDescription> {
+pub fn build_handler() -> Handler<'static, DependencyMap, Result<(), AppError>, DpHandlerDescription>
+{
     dptree::entry()
-        .branch(Update::filter_message().filter_map(extract_url).endpoint(handle_url))
+        .branch(
+            Update::filter_message()
+                .filter_map(extract_url)
+                .endpoint(handle_url),
+        )
         .branch(Update::filter_callback_query().endpoint(handle_callback))
 }
 
@@ -186,7 +193,11 @@ fn extract_url(msg: Message) -> Option<(Message, String)> {
     }
 }
 
-async fn handle_url(bot: Bot, services: AppServices, msg_and_url: (Message, String)) -> Result<(), AppError> {
+async fn handle_url(
+    bot: Bot,
+    services: AppServices,
+    msg_and_url: (Message, String),
+) -> Result<(), AppError> {
     let (msg, url) = msg_and_url;
     let chat_id = msg.chat.id;
     let placeholder = bot.send_message(chat_id, "Inspecting URL…").await?;
@@ -196,7 +207,7 @@ async fn handle_url(bot: Bot, services: AppServices, msg_and_url: (Message, Stri
         Ok(info) => info,
         Err(err) => {
             report_user_error(&bot, chat_id, placeholder.id, "Failed to inspect URL.", err).await?;
-            return Ok(())
+            return Ok(());
         }
     };
 
@@ -247,7 +258,7 @@ async fn handle_url(bot: Bot, services: AppServices, msg_and_url: (Message, Stri
     if rows.is_empty() {
         bot.edit_message_text(chat_id, placeholder.id, "No formats found.")
             .await?;
-        return Ok(())
+        return Ok(());
     }
 
     rows.push(vec![InlineKeyboardButton::callback(
@@ -274,10 +285,14 @@ async fn handle_url(bot: Bot, services: AppServices, msg_and_url: (Message, Stri
     Ok(())
 }
 
-async fn handle_callback(bot: Bot, services: AppServices, q: CallbackQuery) -> Result<(), AppError> {
+async fn handle_callback(
+    bot: Bot,
+    services: AppServices,
+    q: CallbackQuery,
+) -> Result<(), AppError> {
     let data = q.data.clone().unwrap_or_default();
     let Some(message) = q.message.clone() else {
-        return Ok(())
+        return Ok(());
     };
     let chat_id = message.chat.id;
 
@@ -307,7 +322,10 @@ async fn handle_format_selection(
         return Ok(());
     };
 
-    let selection_result: Result<(Option<String>, FormatSelection, Vec<TargetFormat>), &'static str> = {
+    let selection_result: Result<
+        (Option<String>, FormatSelection, Vec<TargetFormat>),
+        &'static str,
+    > = {
         let mut task = task.lock().await;
         if task.message_id != message_id || task.chat_id != chat_id {
             Err("Task mismatch. Try again.")
@@ -508,7 +526,9 @@ async fn handle_cancel_task(
     if remove_now {
         let _ = services.state.tasks.remove(&task_id);
     }
-    let _ = bot.edit_message_text(chat_id, message_id, "Cancelled.").await;
+    let _ = bot
+        .edit_message_text(chat_id, message_id, "Cancelled.")
+        .await;
     Ok(())
 }
 
@@ -531,7 +551,9 @@ async fn run_download_task(
     } = context;
     let _guard = registry.guard(task_id.clone());
     if is_cancelled(&cancel) {
-        let _ = bot.edit_message_text(chat_id, message_id, "Cancelled.").await;
+        let _ = bot
+            .edit_message_text(chat_id, message_id, "Cancelled.")
+            .await;
         return;
     }
     set_task_state(
@@ -584,7 +606,9 @@ async fn run_download_task(
                 },
             )
             .await;
-            let _ = bot.edit_message_text(chat_id, message_id, "Cancelled.").await;
+            let _ = bot
+                .edit_message_text(chat_id, message_id, "Cancelled.")
+                .await;
             return;
         }
         Err(err) => {
@@ -618,7 +642,9 @@ async fn run_download_task(
             },
         )
         .await;
-        let _ = bot.edit_message_text(chat_id, message_id, "Cancelled.").await;
+        let _ = bot
+            .edit_message_text(chat_id, message_id, "Cancelled.")
+            .await;
         return;
     }
 
@@ -648,7 +674,14 @@ async fn run_download_task(
             DownloadResult::InMemory { data } => {
                 let path = temp_file_path();
                 if let Err(err) = tokio::fs::write(&path, data).await {
-                    let _ = report_user_error(&bot, chat_id, message_id, "Failed to prepare file.", err).await;
+                    let _ = report_user_error(
+                        &bot,
+                        chat_id,
+                        message_id,
+                        "Failed to prepare file.",
+                        err,
+                    )
+                    .await;
                     return;
                 }
                 cleanup_paths.push(path.clone());
@@ -696,7 +729,9 @@ async fn run_download_task(
                     },
                 )
                 .await;
-                let _ = bot.edit_message_text(chat_id, message_id, "Cancelled.").await;
+                let _ = bot
+                    .edit_message_text(chat_id, message_id, "Cancelled.")
+                    .await;
                 cleanup_paths_cleanup(cleanup_paths).await;
                 return;
             }
@@ -724,7 +759,9 @@ async fn run_download_task(
         )
         .await;
         if is_cancelled(&cancel) {
-            let _ = bot.edit_message_text(chat_id, message_id, "Cancelled.").await;
+            let _ = bot
+                .edit_message_text(chat_id, message_id, "Cancelled.")
+                .await;
             cleanup_paths_cleanup(cleanup_paths).await;
             set_task_state(
                 &registry,
@@ -736,8 +773,12 @@ async fn run_download_task(
             .await;
             return;
         }
-        if let Err(err) = bot.edit_message_text(chat_id, message_id, "Uploading…").await {
-            let _ = report_user_error(&bot, chat_id, message_id, "Failed to update status.", err).await;
+        if let Err(err) = bot
+            .edit_message_text(chat_id, message_id, "Uploading…")
+            .await
+        {
+            let _ =
+                report_user_error(&bot, chat_id, message_id, "Failed to update status.", err).await;
             cleanup_paths_cleanup(cleanup_paths).await;
             return;
         }
@@ -761,7 +802,9 @@ async fn run_download_task(
         )
         .await;
         if is_cancelled(&cancel) {
-            let _ = bot.edit_message_text(chat_id, message_id, "Cancelled.").await;
+            let _ = bot
+                .edit_message_text(chat_id, message_id, "Cancelled.")
+                .await;
             set_task_state(
                 &registry,
                 &task_id,
@@ -772,8 +815,12 @@ async fn run_download_task(
             .await;
             return;
         }
-        if let Err(err) = bot.edit_message_text(chat_id, message_id, "Uploading…").await {
-            let _ = report_user_error(&bot, chat_id, message_id, "Failed to update status.", err).await;
+        if let Err(err) = bot
+            .edit_message_text(chat_id, message_id, "Uploading…")
+            .await
+        {
+            let _ =
+                report_user_error(&bot, chat_id, message_id, "Failed to update status.", err).await;
             return;
         }
         match download_result {
@@ -803,7 +850,8 @@ async fn run_download_task(
             if let Err(err) = bot.edit_message_text(chat_id, message_id, "Done.").await {
                 let err_text = err.to_string();
                 let _ =
-                    report_user_error(&bot, chat_id, message_id, "Failed to update status.", &err).await;
+                    report_user_error(&bot, chat_id, message_id, "Failed to update status.", &err)
+                        .await;
                 set_task_state(
                     &registry,
                     &task_id,
@@ -894,7 +942,11 @@ where
     result
 }
 
-async fn send_document_with_retry<F>(bot: &Bot, chat_id: ChatId, make_file: F) -> Result<(), AppError>
+async fn send_document_with_retry<F>(
+    bot: &Bot,
+    chat_id: ChatId,
+    make_file: F,
+) -> Result<(), AppError>
 where
     F: Fn() -> InputFile,
 {
@@ -962,14 +1014,9 @@ fn spawn_waiting_format_timeout(
 ) {
     tokio::spawn(async move {
         time::sleep(SELECTION_TIMEOUT).await;
-        expire_task_if_state(
-            &bot,
-            &registry,
-            &task_id,
-            chat_id,
-            message_id,
-            |state| matches!(state, TaskState::WaitingFormat { .. }),
-        )
+        expire_task_if_state(&bot, &registry, &task_id, chat_id, message_id, |state| {
+            matches!(state, TaskState::WaitingFormat { .. })
+        })
         .await;
     });
 }
@@ -983,14 +1030,9 @@ fn spawn_target_selection_timeout(
 ) {
     tokio::spawn(async move {
         time::sleep(SELECTION_TIMEOUT).await;
-        expire_task_if_state(
-            &bot,
-            &registry,
-            &task_id,
-            chat_id,
-            message_id,
-            |state| matches!(state, TaskState::SelectingTarget { .. }),
-        )
+        expire_task_if_state(&bot, &registry, &task_id, chat_id, message_id, |state| {
+            matches!(state, TaskState::SelectingTarget { .. })
+        })
         .await;
     });
 }
@@ -1027,7 +1069,11 @@ async fn expire_task_if_state(
 
     let _ = registry.remove(task_id);
     let _ = bot
-        .edit_message_text(chat_id, message_id, "Selection timed out. Send the link again.")
+        .edit_message_text(
+            chat_id,
+            message_id,
+            "Selection timed out. Send the link again.",
+        )
         .await;
 }
 
@@ -1044,7 +1090,10 @@ struct ProgressTaskContext {
 
 fn spawn_progress_task(
     context: ProgressTaskContext,
-) -> (tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+) -> (
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+) {
     let ProgressTaskContext {
         bot,
         chat_id,
@@ -1243,7 +1292,11 @@ async fn convert_with_ffmpeg(
         .ok_or_else(|| AppError::MissingOutput("ffmpeg stderr".into()))?;
 
     let stdout_task = tokio::spawn(stream_process_output(stdout, progress.clone()));
-    let stderr_task = tokio::spawn(stream_process_output_with_capture(stderr, progress, 16 * 1024));
+    let stderr_task = tokio::spawn(stream_process_output_with_capture(
+        stderr,
+        progress,
+        16 * 1024,
+    ));
 
     let status = loop {
         tokio::select! {
@@ -1272,7 +1325,10 @@ async fn convert_with_ffmpeg(
         if trimmed.is_empty() {
             return Err(AppError::FfmpegFailed(status));
         }
-        return Err(AppError::FfmpegFailedWithOutput(status, trimmed.to_string()));
+        return Err(AppError::FfmpegFailedWithOutput(
+            status,
+            trimmed.to_string(),
+        ));
     }
     Ok(())
 }
@@ -1301,7 +1357,9 @@ fn target_formats_for(kind: MediaKind, source_ext: Option<&str>) -> Vec<TargetFo
     };
     let mut list: Vec<TargetFormat> = targets
         .into_iter()
-        .map(|ext| TargetFormat { ext: ext.to_string() })
+        .map(|ext| TargetFormat {
+            ext: ext.to_string(),
+        })
         .collect();
     if let Some(ext) = source_ext {
         let trimmed = ext.trim();
@@ -1309,7 +1367,12 @@ fn target_formats_for(kind: MediaKind, source_ext: Option<&str>) -> Vec<TargetFo
             .iter()
             .any(|target| target.ext.eq_ignore_ascii_case(trimmed));
         if !exists && !trimmed.is_empty() {
-            list.insert(0, TargetFormat { ext: trimmed.to_string() });
+            list.insert(
+                0,
+                TargetFormat {
+                    ext: trimmed.to_string(),
+                },
+            );
         }
     }
     list
@@ -1354,7 +1417,11 @@ async fn report_user_error(
     err: impl Display,
 ) -> Result<(), AppError> {
     let text = format!("{context}\nError: {err}");
-    if bot.edit_message_text(chat_id, message_id, text.clone()).await.is_err() {
+    if bot
+        .edit_message_text(chat_id, message_id, text.clone())
+        .await
+        .is_err()
+    {
         let _ = bot.send_message(chat_id, text).await;
     }
     Ok(())
@@ -1453,9 +1520,9 @@ fn best_format_ids(formats: &[YtDlpFormat]) -> HashSet<String> {
     for format in formats {
         let ext = format.ext.clone().unwrap_or_else(|| "unknown".to_string());
         let key = format_quality_key(format);
-        let entry = best.entry(ext).or_insert_with(|| {
-            (key.0, key.1, key.2, format.format_id.clone())
-        });
+        let entry = best
+            .entry(ext)
+            .or_insert_with(|| (key.0, key.1, key.2, format.format_id.clone()));
         if (key.0, key.1, key.2) > (entry.0, entry.1, entry.2) {
             *entry = (key.0, key.1, key.2, format.format_id.clone());
         }
@@ -1472,15 +1539,15 @@ fn format_quality_key(format: &YtDlpFormat) -> (i64, i64, i64) {
 }
 
 fn format_bitrate_kbps(format: &YtDlpFormat) -> Option<f64> {
-    if let Some(abr) = format.abr {
-        if abr > 0.0 {
-            return Some(abr);
-        }
+    if let Some(abr) = format.abr
+        && abr > 0.0
+    {
+        return Some(abr);
     }
-    if let Some(tbr) = format.tbr {
-        if tbr > 0.0 {
-            return Some(tbr);
-        }
+    if let Some(tbr) = format.tbr
+        && tbr > 0.0
+    {
+        return Some(tbr);
     }
     let duration = format.duration?;
     if duration <= 0.0 {
@@ -1488,17 +1555,26 @@ fn format_bitrate_kbps(format: &YtDlpFormat) -> Option<f64> {
     }
     let bytes = format.filesize.or(format.filesize_approx)?;
     let kbps = (bytes as f64 * 8.0) / duration / 1000.0;
-    if kbps > 0.0 {
-        Some(kbps)
-    } else {
-        None
-    }
+    if kbps > 0.0 { Some(kbps) } else { None }
 }
 
 fn is_image_ext(ext: Option<&str>) -> bool {
     matches!(
         ext,
-        Some("jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" | "tiff" | "tif" | "svg" | "avif" | "heic" | "heif")
+        Some(
+            "jpg"
+                | "jpeg"
+                | "png"
+                | "webp"
+                | "gif"
+                | "bmp"
+                | "tiff"
+                | "tif"
+                | "svg"
+                | "avif"
+                | "heic"
+                | "heif"
+        )
     )
 }
 
@@ -1527,13 +1603,13 @@ pub fn build_filename(
     let mut name = title.unwrap_or_else(|| fallback_id.to_string());
     name = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == ' ' || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| if is_safe_filename_char(c) { c } else { '_' })
         .collect::<String>();
 
     let mut author = author.unwrap_or_else(|| "Unknown".to_string());
     author = author
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == ' ' || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| if is_safe_filename_char(c) { c } else { '_' })
         .collect::<String>();
 
     if author.trim().is_empty() {
@@ -1542,6 +1618,17 @@ pub fn build_filename(
 
     let ext = ext.unwrap_or_else(|| "bin".to_string());
     format!("{} - {}.{}", name.trim(), author.trim(), ext)
+}
+
+fn is_safe_filename_char(c: char) -> bool {
+    // Keep Unicode (including CJK) and exclude common filesystem-unsafe characters.
+    if c.is_control() {
+        return false;
+    }
+    !matches!(
+        c,
+        '/' | '\\' | '?' | '%' | '*' | ':' | '|' | '"' | '<' | '>'
+    )
 }
 
 pub fn temp_file_path() -> PathBuf {
@@ -1567,6 +1654,17 @@ mod tests {
             "fallback",
         );
         assert_eq!(name, "My_Video_ - A_Author.mp3");
+    }
+
+    #[test]
+    fn build_filename_preserves_unicode() {
+        let name = build_filename(
+            Some("你好 世界".into()),
+            Some("作者".into()),
+            Some("mp4".into()),
+            "fallback",
+        );
+        assert_eq!(name, "你好 世界 - 作者.mp4");
     }
 
     #[test]

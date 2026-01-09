@@ -4,11 +4,11 @@ mod tasks;
 mod yt_dlp;
 
 use crate::error::AppError;
-use handlers::{build_handler, AppServices};
+use handlers::{AppServices, build_handler};
 use std::time::Duration;
 use teloxide::{net::default_reqwest_settings, prelude::*};
 #[cfg(unix)]
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
@@ -52,11 +52,28 @@ async fn run() -> Result<(), AppError> {
 
 #[cfg(unix)]
 async fn shutdown_signal() {
-    let mut term = signal(SignalKind::terminate()).expect("failed to listen for SIGTERM");
-    let mut interrupt = signal(SignalKind::interrupt()).expect("failed to listen for SIGINT");
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = interrupt.recv() => {}
+    let term = signal(SignalKind::terminate());
+    let interrupt = signal(SignalKind::interrupt());
+    match (term, interrupt) {
+        (Ok(mut term), Ok(mut interrupt)) => {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = interrupt.recv() => {}
+            }
+        }
+        (Ok(mut term), Err(err)) => {
+            tracing::warn!("failed to listen for SIGINT: {err}");
+            let _ = term.recv().await;
+        }
+        (Err(err), Ok(mut interrupt)) => {
+            tracing::warn!("failed to listen for SIGTERM: {err}");
+            let _ = interrupt.recv().await;
+        }
+        (Err(term_err), Err(int_err)) => {
+            tracing::warn!("failed to listen for SIGTERM: {term_err}");
+            tracing::warn!("failed to listen for SIGINT: {int_err}");
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 }
 

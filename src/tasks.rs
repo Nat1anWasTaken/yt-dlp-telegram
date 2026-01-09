@@ -1,10 +1,10 @@
 use dashmap::DashMap;
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{Rng, distributions::Alphanumeric};
 use std::{
     collections::HashMap,
     fmt,
     hash::{Hash, Hasher},
-    sync::{atomic::AtomicBool, Arc},
+    sync::{Arc, atomic::AtomicBool},
 };
 use teloxide::types::{ChatId, MessageId};
 use tokio::sync::Mutex;
@@ -78,7 +78,9 @@ pub struct TargetFormat {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum TaskState {
-    WaitingFormat { formats: HashMap<String, FormatMeta> },
+    WaitingFormat {
+        formats: HashMap<String, FormatMeta>,
+    },
     SelectingTarget {
         selection: FormatSelection,
         targets: Vec<TargetFormat>,
@@ -95,7 +97,9 @@ pub enum TaskState {
         selection: FormatSelection,
         target: TargetFormat,
     },
-    Finished { outcome: TaskOutcome },
+    Finished {
+        outcome: TaskOutcome,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

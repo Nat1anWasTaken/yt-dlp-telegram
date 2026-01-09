@@ -4,12 +4,12 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::BytesMut;
+use std::env;
+use std::sync::atomic::Ordering;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
 };
-use std::sync::atomic::Ordering;
-use std::env;
 
 #[derive(Default)]
 pub struct YtDlpClient;
@@ -149,9 +149,7 @@ fn yt_dlp_base_command() -> Command {
         .arg(format!("youtube:player_client={player_client}"));
 
     if matches!(
-        env::var("YTDLP_FORCE_IPV4")
-            .ok()
-            .as_deref(),
+        env::var("YTDLP_FORCE_IPV4").ok().as_deref(),
         Some("1") | Some("true") | Some("TRUE")
     ) {
         cmd.arg("--force-ipv4");
