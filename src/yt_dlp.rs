@@ -1,5 +1,7 @@
-use crate::handlers::{DownloadRequest, DownloadResult};
-use anyhow::{anyhow, Context, Result};
+use crate::{
+    error::AppError,
+    handlers::{DownloadRequest, DownloadResult},
+};
 use async_trait::async_trait;
 use bytes::BytesMut;
 use tokio::{
@@ -12,44 +14,44 @@ pub struct YtDlpClient;
 
 #[async_trait]
 pub trait MediaProvider: Send + Sync {
-    async fn fetch_formats(&self, url: &str) -> Result<crate::handlers::YtDlpInfo>;
+    async fn fetch_formats(&self, url: &str) -> Result<crate::handlers::YtDlpInfo, AppError>;
 }
 
 #[async_trait]
 pub trait Downloader: Send + Sync {
-    async fn download(&self, req: DownloadRequest) -> Result<DownloadResult>;
+    async fn download(&self, req: DownloadRequest) -> Result<DownloadResult, AppError>;
 }
 
 #[async_trait]
 impl MediaProvider for YtDlpClient {
-    async fn fetch_formats(&self, url: &str) -> Result<crate::handlers::YtDlpInfo> {
+    async fn fetch_formats(&self, url: &str) -> Result<crate::handlers::YtDlpInfo, AppError> {
         let output = Command::new("yt-dlp")
             .arg("-J")
             .arg("--no-playlist")
             .arg(url)
             .output()
             .await
-            .context("Failed to spawn yt-dlp")?;
+            .map_err(AppError::Io)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!(stderr.trim().to_string()));
+            return Err(AppError::YtDlp(stderr.trim().to_string()));
         }
 
-        let info: crate::handlers::YtDlpInfo = serde_json::from_slice(&output.stdout)
-            .context("Failed to parse yt-dlp JSON output")?;
+        let info: crate::handlers::YtDlpInfo =
+            serde_json::from_slice(&output.stdout).map_err(AppError::Json)?;
         Ok(info)
     }
 }
 
 #[async_trait]
 impl Downloader for YtDlpClient {
-    async fn download(&self, req: DownloadRequest) -> Result<DownloadResult> {
+    async fn download(&self, req: DownloadRequest) -> Result<DownloadResult, AppError> {
         download_with_progress(req).await
     }
 }
 
-async fn download_with_progress(req: DownloadRequest) -> Result<DownloadResult> {
+async fn download_with_progress(req: DownloadRequest) -> Result<DownloadResult, AppError> {
     let mut child = Command::new("yt-dlp")
         .arg("-f")
         .arg(&req.format_id)
@@ -62,10 +64,16 @@ async fn download_with_progress(req: DownloadRequest) -> Result<DownloadResult> 
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .context("Failed to spawn yt-dlp")?;
+        .map_err(AppError::Io)?;
 
-    let stdout = child.stdout.take().context("Missing yt-dlp stdout")?;
-    let stderr = child.stderr.take().context("Missing yt-dlp stderr")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::MissingOutput("stdout".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| AppError::MissingOutput("stderr".into()))?;
 
     let progress = req.progress.clone();
     let stderr_task = tokio::spawn(async move {
@@ -82,7 +90,7 @@ async fn download_with_progress(req: DownloadRequest) -> Result<DownloadResult> 
     let mut chunk = vec![0u8; 64 * 1024];
 
     loop {
-        let read = reader.read(&mut chunk).await?;
+        let read = reader.read(&mut chunk).await.map_err(AppError::Io)?;
         if read == 0 {
             break;
         }
@@ -91,23 +99,23 @@ async fn download_with_progress(req: DownloadRequest) -> Result<DownloadResult> 
         } else {
             if temp_file.is_none() {
                 let path = crate::handlers::temp_file_path();
-                let mut file = tokio::fs::File::create(&path).await?;
-                file.write_all(&buffer).await?;
+                let mut file = tokio::fs::File::create(&path).await.map_err(AppError::Io)?;
+                file.write_all(&buffer).await.map_err(AppError::Io)?;
                 buffer.clear();
                 temp_file = Some(file);
                 temp_path = Some(path);
             }
             if let Some(file) = temp_file.as_mut() {
-                file.write_all(&chunk[..read]).await?;
+                file.write_all(&chunk[..read]).await.map_err(AppError::Io)?;
             }
         }
     }
 
-    let status = child.wait().await?;
+    let status = child.wait().await.map_err(AppError::Io)?;
     let _ = stderr_task.await;
 
     if !status.success() {
-        return Err(anyhow!("yt-dlp exited with {status}"));
+        return Err(AppError::DownloadFailed(status));
     }
 
     let filename = crate::handlers::build_filename(req.title, req.ext, &req.format_id);

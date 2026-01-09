@@ -1,5 +1,5 @@
+use crate::error::AppError;
 use crate::yt_dlp::{Downloader, MediaProvider, YtDlpClient};
-use anyhow::Result;
 use dashmap::DashMap;
 use rand::{distributions::Alphanumeric, Rng};
 use serde::Deserialize;
@@ -14,12 +14,17 @@ use teloxide::{
     dispatching::DpHandlerDescription,
     prelude::*,
     types::{InlineKeyboardButton, InlineKeyboardMarkup, InputFile, MessageId},
+    RequestError,
 };
 use tokio::{sync::Mutex, time};
+use tracing::warn;
 
 pub const MAX_IN_MEMORY_BYTES: usize = 50 * 1024 * 1024; // 50MB
 const PROGRESS_LINES: usize = 6;
 pub const PROGRESS_UPDATE_EVERY: Duration = Duration::from_secs(2);
+const UPLOAD_MAX_RETRIES: usize = 3;
+const UPLOAD_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
+const UPLOAD_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct AppState {
@@ -135,7 +140,7 @@ pub struct DownloadRequest {
     pub ext: Option<String>,
 }
 
-pub fn build_handler() -> Handler<'static, DependencyMap, Result<()>, DpHandlerDescription> {
+pub fn build_handler() -> Handler<'static, DependencyMap, Result<(), AppError>, DpHandlerDescription> {
     dptree::entry()
         .branch(Update::filter_message().filter_map(extract_url).endpoint(handle_url))
         .branch(Update::filter_callback_query().endpoint(handle_callback))
@@ -150,7 +155,7 @@ fn extract_url(msg: Message) -> Option<(Message, String)> {
     }
 }
 
-async fn handle_url(bot: Bot, services: AppServices, msg_and_url: (Message, String)) -> Result<()> {
+async fn handle_url(bot: Bot, services: AppServices, msg_and_url: (Message, String)) -> Result<(), AppError> {
     let (msg, url) = msg_and_url;
     let chat_id = msg.chat.id;
     let placeholder = bot.send_message(chat_id, "Inspecting URL…").await?;
@@ -160,7 +165,7 @@ async fn handle_url(bot: Bot, services: AppServices, msg_and_url: (Message, Stri
         Ok(info) => info,
         Err(err) => {
             report_user_error(&bot, chat_id, placeholder.id, "Failed to inspect URL.", err).await?;
-            return Ok(());
+            return Ok(())
         }
     };
 
@@ -195,7 +200,7 @@ async fn handle_url(bot: Bot, services: AppServices, msg_and_url: (Message, Stri
     if rows.is_empty() {
         bot.edit_message_text(chat_id, placeholder.id, "No formats found.")
             .await?;
-        return Ok(());
+        return Ok(())
     }
 
     let keyboard = InlineKeyboardMarkup::new(rows);
@@ -210,15 +215,15 @@ async fn handle_url(bot: Bot, services: AppServices, msg_and_url: (Message, Stri
     Ok(())
 }
 
-async fn handle_callback(bot: Bot, services: AppServices, q: CallbackQuery) -> Result<()> {
+async fn handle_callback(bot: Bot, services: AppServices, q: CallbackQuery) -> Result<(), AppError> {
     let data = q.data.clone().unwrap_or_default();
     let Some(message) = q.message.clone() else {
-        return Ok(());
+        return Ok(())
     };
     let chat_id = message.chat.id;
 
     if !data.starts_with("fmt:") {
-        return Ok(());
+        return Ok(())
     }
     let key = data.trim_start_matches("fmt:");
     let selection = match services.state.selections.get(key) {
@@ -226,7 +231,7 @@ async fn handle_callback(bot: Bot, services: AppServices, q: CallbackQuery) -> R
         None => {
             bot.edit_message_text(chat_id, message.id, "Selection expired. Try again.")
                 .await?;
-            return Ok(());
+            return Ok(())
         }
     };
 
@@ -289,9 +294,12 @@ async fn handle_callback(bot: Bot, services: AppServices, q: CallbackQuery) -> R
             if let Err(err) = bot.edit_message_text(chat_id, message_id, "Uploading…").await {
                 report_user_error(&bot, chat_id, message_id, "Failed to update status.", err).await?;
             }
-            if let Err(err) = bot
-                .send_document(chat_id, InputFile::memory(data).file_name(filename))
-                .await
+            let data = bytes::Bytes::from(data);
+            let filename = filename.clone();
+            if let Err(err) = send_document_with_retry(&bot, chat_id, move || {
+                InputFile::memory(data.clone()).file_name(filename.clone())
+            })
+            .await
             {
                 report_user_error(&bot, chat_id, message_id, "Upload failed.", err).await?;
             } else if let Err(err) = bot.edit_message_text(chat_id, message_id, "Done.").await {
@@ -302,9 +310,12 @@ async fn handle_callback(bot: Bot, services: AppServices, q: CallbackQuery) -> R
             if let Err(err) = bot.edit_message_text(chat_id, message_id, "Uploading…").await {
                 report_user_error(&bot, chat_id, message_id, "Failed to update status.", err).await?;
             }
-            if let Err(err) = bot
-                .send_document(chat_id, InputFile::file(path.clone()).file_name(filename))
-                .await
+            let path_for_upload = path.clone();
+            let filename_for_upload = filename.clone();
+            if let Err(err) = send_document_with_retry(&bot, chat_id, move || {
+                InputFile::file(path_for_upload.clone()).file_name(filename_for_upload.clone())
+            })
+            .await
             {
                 report_user_error(&bot, chat_id, message_id, "Upload failed.", err).await?;
             } else if let Err(err) = bot.edit_message_text(chat_id, message_id, "Done.").await {
@@ -320,13 +331,57 @@ async fn handle_callback(bot: Bot, services: AppServices, q: CallbackQuery) -> R
     Ok(())
 }
 
+async fn send_document_with_retry<F>(bot: &Bot, chat_id: ChatId, make_file: F) -> Result<(), AppError>
+where
+    F: Fn() -> InputFile,
+{
+    for attempt in 1..=UPLOAD_MAX_RETRIES {
+        match bot.send_document(chat_id, make_file()).await {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                let Some(delay) = retry_delay_for_upload(&err, attempt) else {
+                    return Err(err.into());
+                };
+                if attempt == UPLOAD_MAX_RETRIES {
+                    return Err(err.into());
+                }
+                if delay > Duration::ZERO {
+                    warn!("Upload attempt {attempt} failed; retrying in {delay:?}: {err}");
+                    time::sleep(delay).await;
+                } else {
+                    warn!("Upload attempt {attempt} failed; retrying immediately: {err}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn retry_delay_for_upload(err: &RequestError, attempt: usize) -> Option<Duration> {
+    match err {
+        RequestError::RetryAfter(delay) => Some(*delay),
+        RequestError::Network(net) if net.is_timeout() || net.is_connect() => {
+            let base_ms = UPLOAD_RETRY_BASE_DELAY.as_millis() as u64;
+            let factor = 1u64 << (attempt - 1).min(16);
+            let mut delay_ms = base_ms.saturating_mul(factor);
+            let max_ms = UPLOAD_RETRY_MAX_DELAY.as_millis() as u64;
+            if delay_ms > max_ms {
+                delay_ms = max_ms;
+            }
+            let jitter_ms = rand::thread_rng().gen_range(0..=500);
+            Some(Duration::from_millis(delay_ms + jitter_ms))
+        }
+        _ => None,
+    }
+}
+
 async fn report_user_error(
     bot: &Bot,
     chat_id: ChatId,
     message_id: MessageId,
     context: &str,
     err: impl Display,
-) -> Result<()> {
+) -> Result<(), AppError> {
     let text = format!("{context}\nError: {err}");
     if bot.edit_message_text(chat_id, message_id, text.clone()).await.is_err() {
         let _ = bot.send_message(chat_id, text).await;
