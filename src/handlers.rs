@@ -111,7 +111,7 @@ fn is_user_allowed(allowed_user_ids: &Option<HashSet<u64>>, user_id: u64) -> boo
 async fn reject_user(bot: &Bot, chat_id: ChatId, user_id: u64) -> Result<(), AppError> {
     bot.send_message(
         chat_id,
-        format!("you don't have permission to use this, here's your user id: {user_id}"),
+        format!("You do not have permission to use this bot. Your user ID is: {user_id}"),
     )
     .await?;
     Ok(())
