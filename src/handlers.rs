@@ -9,6 +9,7 @@ use rand::{Rng, distributions::Alphanumeric};
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    env,
     fmt::Display,
     path::{Path, PathBuf},
     process::Stdio,
@@ -65,6 +66,7 @@ pub struct AppServices {
     state: AppState,
     media: Arc<dyn MediaProvider>,
     downloader: Arc<dyn Downloader>,
+    allowed_user_ids: Option<HashSet<i64>>,
 }
 
 impl AppServices {
@@ -74,8 +76,45 @@ impl AppServices {
             state: AppState::default(),
             media: yt_dlp.clone(),
             downloader: yt_dlp,
+            allowed_user_ids: read_allowed_user_ids(),
         }
     }
+}
+
+fn read_allowed_user_ids() -> Option<HashSet<i64>> {
+    let raw = env::var("ALLOWED_USER_IDS").ok()?;
+    let mut ids = HashSet::new();
+    for entry in raw.split(',') {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match trimmed.parse::<i64>() {
+            Ok(id) => {
+                ids.insert(id);
+            }
+            Err(err) => {
+                warn!("Ignoring invalid ALLOWED_USER_IDS entry '{trimmed}': {err}");
+            }
+        }
+    }
+    if ids.is_empty() { None } else { Some(ids) }
+}
+
+fn is_user_allowed(allowed_user_ids: &Option<HashSet<i64>>, user_id: i64) -> bool {
+    allowed_user_ids
+        .as_ref()
+        .map(|allowed| allowed.contains(&user_id))
+        .unwrap_or(true)
+}
+
+async fn reject_user(bot: &Bot, chat_id: ChatId, user_id: i64) -> Result<(), AppError> {
+    bot.send_message(
+        chat_id,
+        format!("you don't have permission to use this, here's your user id: {user_id}"),
+    )
+    .await?;
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -181,6 +220,11 @@ pub fn build_handler() -> Handler<'static, DependencyMap, Result<(), AppError>, 
                 .filter_map(extract_url)
                 .endpoint(handle_url),
         )
+        .branch(
+            Update::filter_message()
+                .filter_map(extract_non_url)
+                .endpoint(handle_non_url),
+        )
         .branch(Update::filter_callback_query().endpoint(handle_callback))
 }
 
@@ -193,6 +237,21 @@ fn extract_url(msg: Message) -> Option<(Message, String)> {
     }
 }
 
+fn extract_non_url(msg: Message) -> Option<Message> {
+    let text = msg.text()?.trim();
+    if text.starts_with("http://") || text.starts_with("https://") {
+        None
+    } else {
+        Some(msg)
+    }
+}
+
+fn message_user_id(msg: &Message) -> i64 {
+    msg.from()
+        .map(|user| user.id.0)
+        .unwrap_or_else(|| msg.chat.id.0)
+}
+
 async fn handle_url(
     bot: Bot,
     services: AppServices,
@@ -200,6 +259,11 @@ async fn handle_url(
 ) -> Result<(), AppError> {
     let (msg, url) = msg_and_url;
     let chat_id = msg.chat.id;
+    let user_id = message_user_id(&msg);
+    if !is_user_allowed(&services.allowed_user_ids, user_id) {
+        reject_user(&bot, chat_id, user_id).await?;
+        return Ok(());
+    }
     let placeholder = bot.send_message(chat_id, "Inspecting URL…").await?;
 
     let info = services.media.fetch_formats(&url).await;
@@ -285,6 +349,17 @@ async fn handle_url(
     Ok(())
 }
 
+async fn handle_non_url(bot: Bot, services: AppServices, msg: Message) -> Result<(), AppError> {
+    let chat_id = msg.chat.id;
+    let user_id = message_user_id(&msg);
+    if !is_user_allowed(&services.allowed_user_ids, user_id) {
+        reject_user(&bot, chat_id, user_id).await?;
+        return Ok(());
+    }
+    bot.send_message(chat_id, "Send any URL.").await?;
+    Ok(())
+}
+
 async fn handle_callback(
     bot: Bot,
     services: AppServices,
@@ -295,6 +370,12 @@ async fn handle_callback(
         return Ok(());
     };
     let chat_id = message.chat.id;
+    let user_id = q.from.id.0;
+    if !is_user_allowed(&services.allowed_user_ids, user_id) {
+        bot.answer_callback_query(q.id).await?;
+        reject_user(&bot, chat_id, user_id).await?;
+        return Ok(());
+    }
 
     if let Some(task_id) = parse_cancel_callback(&data) {
         handle_cancel_task(&bot, services, q, message.id, chat_id, task_id).await
