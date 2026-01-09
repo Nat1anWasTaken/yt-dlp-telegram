@@ -1,5 +1,6 @@
 mod error;
 mod handlers;
+mod tasks;
 mod yt_dlp;
 
 use crate::error::AppError;

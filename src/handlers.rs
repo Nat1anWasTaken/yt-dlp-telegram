@@ -1,6 +1,9 @@
 use crate::error::AppError;
+use crate::tasks::{
+    build_task_callback, parse_task_callback, DownloadTask, FormatMeta, FormatSelection, TaskId,
+    TaskOutcome, TaskRegistry, TaskState,
+};
 use crate::yt_dlp::{Downloader, MediaProvider, YtDlpClient};
-use dashmap::DashMap;
 use rand::{distributions::Alphanumeric, Rng};
 use serde::Deserialize;
 use std::{
@@ -28,14 +31,12 @@ const UPLOAD_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct AppState {
-    selections: Arc<DashMap<String, FormatSelection>>,
+    tasks: TaskRegistry,
 }
 
 impl Default for AppState {
     fn default() -> Self {
-        Self {
-            selections: Arc::new(DashMap::new()),
-        }
+        Self { tasks: TaskRegistry::new() }
     }
 }
 
@@ -55,14 +56,6 @@ impl AppServices {
             downloader: yt_dlp,
         }
     }
-}
-
-#[derive(Clone)]
-struct FormatSelection {
-    url: String,
-    format_id: String,
-    title: Option<String>,
-    ext: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -187,21 +180,25 @@ async fn handle_url(bot: Bot, services: AppServices, msg_and_url: (Message, Stri
         })
     });
 
+    let mut formats_map = HashMap::new();
+    for format in formats.iter().take(8) {
+        formats_map.insert(
+            format.format_id.clone(),
+            FormatMeta {
+                ext: format.ext.clone(),
+            },
+        );
+    }
+    let task = DownloadTask::new(chat_id, placeholder.id, url.clone(), title.clone(), formats_map);
+    let task_id = task.id.clone();
+    services.state.tasks.insert(task);
+
     let mut rows = Vec::new();
     for format in formats.into_iter().take(8) {
         let is_best = best_format_ids.contains(&format.format_id);
         let label = format_label(&format, is_best);
-        let key = generate_key();
-        services.state.selections.insert(
-            key.clone(),
-            FormatSelection {
-                url: url.clone(),
-                format_id: format.format_id,
-                title: title.clone(),
-                ext: format.ext,
-            },
-        );
-        rows.push(vec![InlineKeyboardButton::callback(label, format!("fmt:{key}"))]);
+        let callback = build_task_callback(&task_id, &format.format_id);
+        rows.push(vec![InlineKeyboardButton::callback(label, callback)]);
     }
 
     if rows.is_empty() {
@@ -229,35 +226,101 @@ async fn handle_callback(bot: Bot, services: AppServices, q: CallbackQuery) -> R
     };
     let chat_id = message.chat.id;
 
-    if !data.starts_with("fmt:") {
-        return Ok(())
-    }
-    let key = data.trim_start_matches("fmt:");
-    let selection = match services.state.selections.get(key) {
-        Some(sel) => sel.clone(),
-        None => {
-            bot.edit_message_text(chat_id, message.id, "Selection expired. Try again.")
+    let Some((task_id, format_id)) = parse_task_callback(&data) else {
+        return Ok(());
+    };
+    let Some(task) = services.state.tasks.get(&task_id) else {
+        bot.edit_message_text(chat_id, message.id, "Task expired. Try again.")
+            .await?;
+        return Ok(());
+    };
+
+    let selection_result: Result<(String, Option<String>, FormatSelection), &'static str> = {
+        let mut task = task.lock().await;
+        if task.message_id != message.id || task.chat_id != chat_id {
+            Err("Task mismatch. Try again.")
+        } else {
+            match &task.state {
+                TaskState::WaitingFormat { formats } => {
+                    if let Some(meta) = formats.get(&format_id).cloned() {
+                        let selection = FormatSelection {
+                            format_id: format_id.clone(),
+                            ext: meta.ext,
+                        };
+                        task.state = TaskState::PendingDownload {
+                            selection: selection.clone(),
+                        };
+                        Ok((task.url.clone(), task.title.clone(), selection))
+                    } else {
+                        Err("Format expired. Try again.")
+                    }
+                }
+                _ => Err("Task already started."),
+            }
+        }
+    };
+
+    let (url, title, selection) = match selection_result {
+        Ok(data) => data,
+        Err(error_message) => {
+            bot.edit_message_text(chat_id, message.id, error_message)
                 .await?;
-            return Ok(())
+            return Ok(());
         }
     };
 
     bot.answer_callback_query(q.id).await?;
-    bot.edit_message_text(chat_id, message.id, "Starting download…")
+    bot.edit_message_text(chat_id, message.id, "Queued for download…")
         .await?;
+
+    let registry = services.state.tasks.clone();
+    let downloader = services.downloader.clone();
+    let bot_clone = bot.clone();
+    let message_id = message.id;
+    tokio::spawn(async move {
+        run_download_task(
+            bot_clone,
+            registry,
+            downloader,
+            task_id,
+            chat_id,
+            message_id,
+            url,
+            title,
+            selection,
+        )
+        .await;
+    });
+
+    Ok(())
+}
+
+async fn run_download_task(
+    bot: Bot,
+    registry: TaskRegistry,
+    downloader: Arc<dyn Downloader>,
+    task_id: TaskId,
+    chat_id: ChatId,
+    message_id: MessageId,
+    url: String,
+    title: Option<String>,
+    selection: FormatSelection,
+) {
+    let _guard = registry.guard(task_id.clone());
+    set_task_state(
+        &registry,
+        &task_id,
+        TaskState::Downloading {
+            selection: selection.clone(),
+        },
+    )
+    .await;
 
     let progress = ProgressState::new();
     let progress_clone = progress.clone();
     let bot_clone = bot.clone();
-    let url = selection.url.clone();
-    let format_id = selection.format_id.clone();
-    let title = selection.title.clone();
     let progress_title = title.clone();
-    let ext = selection.ext.clone();
-    let message_id = message.id;
-
     let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
-
     let progress_task = tokio::spawn(async move {
         let mut ticker = time::interval(PROGRESS_UPDATE_EVERY);
         let mut notified = false;
@@ -295,60 +358,122 @@ async fn handle_callback(bot: Bot, services: AppServices, q: CallbackQuery) -> R
         }
     });
 
-    let result = services
-        .downloader
+    let result = downloader
         .download(DownloadRequest {
             url,
-            format_id,
+            format_id: selection.format_id.clone(),
             progress,
             title: title.clone(),
-            ext: ext.clone(),
+            ext: selection.ext.clone(),
         })
         .await;
 
     let _ = done_tx.send(true);
     let _ = progress_task.await;
 
-    match result {
+    let upload_result = match result {
         Ok(DownloadResult::InMemory { data, filename }) => {
+            set_task_state(
+                &registry,
+                &task_id,
+                TaskState::Uploading {
+                    selection: selection.clone(),
+                },
+            )
+            .await;
             if let Err(err) = bot.edit_message_text(chat_id, message_id, "Uploading…").await {
-                report_user_error(&bot, chat_id, message_id, "Failed to update status.", err).await?;
+                let _ = report_user_error(&bot, chat_id, message_id, "Failed to update status.", err).await;
+                return;
             }
             let data = bytes::Bytes::from(data);
             let filename = filename.clone();
-            if let Err(err) = upload_with_progress(&bot, chat_id, message_id, move || {
+            upload_with_progress(&bot, chat_id, message_id, move || {
                 InputFile::memory(data.clone()).file_name(filename.clone())
             })
             .await
-            {
-                report_user_error(&bot, chat_id, message_id, "Upload failed.", err).await?;
-            } else if let Err(err) = bot.edit_message_text(chat_id, message_id, "Done.").await {
-                report_user_error(&bot, chat_id, message_id, "Failed to update status.", err).await?;
-            }
         }
         Ok(DownloadResult::TempFile { path, filename }) => {
+            set_task_state(
+                &registry,
+                &task_id,
+                TaskState::Uploading {
+                    selection: selection.clone(),
+                },
+            )
+            .await;
             if let Err(err) = bot.edit_message_text(chat_id, message_id, "Uploading…").await {
-                report_user_error(&bot, chat_id, message_id, "Failed to update status.", err).await?;
+                let _ = report_user_error(&bot, chat_id, message_id, "Failed to update status.", err).await;
+                return;
             }
             let path_for_upload = path.clone();
             let filename_for_upload = filename.clone();
-            if let Err(err) = upload_with_progress(&bot, chat_id, message_id, move || {
+            let result = upload_with_progress(&bot, chat_id, message_id, move || {
                 InputFile::file(path_for_upload.clone()).file_name(filename_for_upload.clone())
             })
-            .await
-            {
-                report_user_error(&bot, chat_id, message_id, "Upload failed.", err).await?;
-            } else if let Err(err) = bot.edit_message_text(chat_id, message_id, "Done.").await {
-                report_user_error(&bot, chat_id, message_id, "Failed to update status.", err).await?;
-            }
+            .await;
             let _ = tokio::fs::remove_file(path).await;
+            result
         }
         Err(err) => {
-            report_user_error(&bot, chat_id, message_id, "Download failed.", err).await?;
+            let err_text = err.to_string();
+            let _ = report_user_error(&bot, chat_id, message_id, "Download failed.", &err).await;
+            set_task_state(
+                &registry,
+                &task_id,
+                TaskState::Finished {
+                    outcome: TaskOutcome::Failed(err_text),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+
+    match upload_result {
+        Ok(()) => {
+            if let Err(err) = bot.edit_message_text(chat_id, message_id, "Done.").await {
+                let err_text = err.to_string();
+                let _ =
+                    report_user_error(&bot, chat_id, message_id, "Failed to update status.", &err).await;
+                set_task_state(
+                    &registry,
+                    &task_id,
+                    TaskState::Finished {
+                        outcome: TaskOutcome::Failed(err_text),
+                    },
+                )
+                .await;
+                return;
+            }
+            set_task_state(
+                &registry,
+                &task_id,
+                TaskState::Finished {
+                    outcome: TaskOutcome::Success,
+                },
+            )
+            .await;
+        }
+        Err(err) => {
+            let err_text = err.to_string();
+            let _ = report_user_error(&bot, chat_id, message_id, "Upload failed.", &err).await;
+            set_task_state(
+                &registry,
+                &task_id,
+                TaskState::Finished {
+                    outcome: TaskOutcome::Failed(err_text),
+                },
+            )
+            .await;
         }
     }
+}
 
-    Ok(())
+async fn set_task_state(registry: &TaskRegistry, task_id: &TaskId, state: TaskState) {
+    if let Some(task) = registry.get(task_id) {
+        let mut task = task.lock().await;
+        task.state = state;
+    }
 }
 
 async fn upload_with_progress<F>(
@@ -590,14 +715,6 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
-fn generate_key() -> String {
-    rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(10)
-        .map(char::from)
-        .collect()
-}
-
 pub fn build_filename(title: Option<String>, ext: Option<String>, fallback_id: &str) -> String {
     let mut name = title.unwrap_or_else(|| fallback_id.to_string());
     name = name
@@ -616,4 +733,35 @@ pub fn temp_file_path() -> PathBuf {
         .map(char::from)
         .collect();
     std::env::temp_dir().join(format!("yt-dlp-telegram-{suffix}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_filename_sanitizes_and_adds_ext() {
+        let name = build_filename(Some("My/Video?".into()), Some("mp3".into()), "fallback");
+        assert_eq!(name, "My_Video_.mp3");
+    }
+
+    #[test]
+    fn format_label_includes_best_marker() {
+        let format = YtDlpFormat {
+            format_id: "18".into(),
+            ext: Some("mp4".into()),
+            format_note: None,
+            height: Some(720),
+            width: Some(1280),
+            tbr: Some(1000.0),
+            abr: None,
+            vcodec: Some("avc1".into()),
+            acodec: Some("mp4a".into()),
+            filesize: Some(1_000_000),
+            filesize_approx: None,
+            duration: Some(60.0),
+        };
+        let label = format_label(&format, true);
+        assert!(label.starts_with("⭐ "));
+    }
 }
