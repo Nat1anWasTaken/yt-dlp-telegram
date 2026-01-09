@@ -1539,15 +1539,15 @@ fn format_quality_key(format: &YtDlpFormat) -> (i64, i64, i64) {
 }
 
 fn format_bitrate_kbps(format: &YtDlpFormat) -> Option<f64> {
-    if let Some(abr) = format.abr
-        && abr > 0.0
-    {
-        return Some(abr);
+    if let Some(abr) = format.abr {
+        if abr > 0.0 {
+            return Some(abr);
+        }
     }
-    if let Some(tbr) = format.tbr
-        && tbr > 0.0
-    {
-        return Some(tbr);
+    if let Some(tbr) = format.tbr {
+        if tbr > 0.0 {
+            return Some(tbr);
+        }
     }
     let duration = format.duration?;
     if duration <= 0.0 {
