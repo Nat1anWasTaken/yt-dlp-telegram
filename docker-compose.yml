@@ -2,6 +2,8 @@ services:
   bot:
     build:
       context: .
+    image: ghcr.io/nat1anwastaken/yt-dlp-telegram:latest
+    pull_policy: always
     env_file:
       - .env
     environment:
