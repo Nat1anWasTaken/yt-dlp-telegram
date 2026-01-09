@@ -793,7 +793,7 @@ async fn run_download_task(
             .await;
             let _ = bot
                 .edit_message_text(chat_id, message_id, "Cancelled.")
-            .await;
+                .await;
             return;
         }
         Err(err) => {
@@ -1141,36 +1141,36 @@ where
     let started_at = time::Instant::now();
     let progress_task = tokio::spawn(
         async move {
-        let mut ticker = time::interval(PROGRESS_UPDATE_EVERY);
-        let mut last_text: Option<String> = None;
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    let elapsed = started_at.elapsed().as_secs();
-                    let text = format!("Uploading… {}s elapsed", elapsed);
-                    if last_text.as_deref() == Some(text.as_str()) {
-                        continue;
-                    }
-                    match bot_clone.edit_message_text(chat_id, message_id, text.clone()).await {
-                        Ok(_) => {
-                            last_text = Some(text);
+            let mut ticker = time::interval(PROGRESS_UPDATE_EVERY);
+            let mut last_text: Option<String> = None;
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let elapsed = started_at.elapsed().as_secs();
+                        let text = format!("Uploading… {}s elapsed", elapsed);
+                        if last_text.as_deref() == Some(text.as_str()) {
+                            continue;
                         }
-                        Err(err) => {
-                            if is_message_not_modified(&err) {
+                        match bot_clone.edit_message_text(chat_id, message_id, text.clone()).await {
+                            Ok(_) => {
                                 last_text = Some(text);
-                                continue;
                             }
-                            warn!(event = "upload_progress_edit_failed", error = %err);
+                            Err(err) => {
+                                if is_message_not_modified(&err) {
+                                    last_text = Some(text);
+                                    continue;
+                                }
+                                warn!(event = "upload_progress_edit_failed", error = %err);
+                            }
                         }
                     }
-                }
-                _ = done_rx.changed() => {
-                    break;
+                    _ = done_rx.changed() => {
+                        break;
+                    }
                 }
             }
         }
-    }
-    .in_current_span(),
+        .in_current_span(),
     );
 
     let result = send_document_with_retry(bot, chat_id, make_file).await;
@@ -1569,7 +1569,8 @@ async fn convert_with_ffmpeg(
         .take()
         .ok_or_else(|| AppError::MissingOutput("ffmpeg stderr".into()))?;
 
-    let stdout_task = tokio::spawn(stream_process_output(stdout, progress.clone()).in_current_span());
+    let stdout_task =
+        tokio::spawn(stream_process_output(stdout, progress.clone()).in_current_span());
     let stderr_task = tokio::spawn(
         stream_process_output_with_capture(stderr, progress, 16 * 1024).in_current_span(),
     );

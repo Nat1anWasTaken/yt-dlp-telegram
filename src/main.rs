@@ -65,7 +65,10 @@ async fn shutdown_signal() {
     let interrupt = signal(SignalKind::interrupt());
     match (term, interrupt) {
         (Ok(mut term), Ok(mut interrupt)) => {
-            info!(event = "shutdown_signal_listening", signal = "term_or_interrupt");
+            info!(
+                event = "shutdown_signal_listening",
+                signal = "term_or_interrupt"
+            );
             tokio::select! {
                 _ = term.recv() => {}
                 _ = interrupt.recv() => {}

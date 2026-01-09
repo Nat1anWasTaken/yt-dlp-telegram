@@ -46,7 +46,10 @@ impl MediaProvider for YtDlpClient {
 
         let info: crate::handlers::YtDlpInfo =
             serde_json::from_slice(&output.stdout).map_err(AppError::Json)?;
-        info!(event = "fetch_formats_success", format_count = info.formats.len());
+        info!(
+            event = "fetch_formats_success",
+            format_count = info.formats.len()
+        );
         Ok(info)
     }
 }
@@ -133,7 +136,10 @@ async fn download_with_progress(req: DownloadRequest) -> Result<DownloadResult, 
             return Err(AppError::Cancelled);
         }
         if temp_file.is_none() && buffer.len() + read <= crate::handlers::MAX_IN_MEMORY_BYTES {
-            trace!(event = "download_buffer_in_memory", buffered_bytes = buffer.len() + read);
+            trace!(
+                event = "download_buffer_in_memory",
+                buffered_bytes = buffer.len() + read
+            );
             buffer.extend_from_slice(&chunk[..read]);
         } else {
             if temp_file.is_none() {
