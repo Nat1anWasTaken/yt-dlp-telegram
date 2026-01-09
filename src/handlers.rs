@@ -35,6 +35,18 @@ const UPLOAD_MAX_RETRIES: usize = 3;
 const UPLOAD_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 const UPLOAD_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 
+type TargetSelectionResult = Result<
+    (
+        String,
+        Option<String>,
+        Option<String>,
+        FormatSelection,
+        TargetFormat,
+        Arc<AtomicBool>,
+    ),
+    &'static str,
+>;
+
 #[derive(Clone)]
 struct AppState {
     tasks: TaskRegistry,
@@ -389,17 +401,7 @@ async fn handle_target_selection(
         return Ok(());
     };
 
-    let selection_result: Result<
-        (
-            String,
-            Option<String>,
-            Option<String>,
-            FormatSelection,
-            TargetFormat,
-            Arc<AtomicBool>,
-        ),
-        &'static str,
-    > = {
+    let selection_result: TargetSelectionResult = {
         let mut task = task.lock().await;
         if task.message_id != message_id || task.chat_id != chat_id {
             Err("Task mismatch. Try again.")
@@ -548,16 +550,16 @@ async fn run_download_task(
         .edit_message_text(chat_id, message_id, "Downloading…")
         .reply_markup(cancel_keyboard.clone())
         .await;
-    let (done_tx, progress_task) = spawn_progress_task(
-        bot.clone(),
+    let (done_tx, progress_task) = spawn_progress_task(ProgressTaskContext {
+        bot: bot.clone(),
         chat_id,
         message_id,
-        progress.clone(),
-        title.clone(),
-        "Downloading",
-        cancel.clone(),
-        cancel_keyboard.clone(),
-    );
+        progress: progress.clone(),
+        title: title.clone(),
+        phase: "Downloading",
+        cancel: cancel.clone(),
+        keyboard: cancel_keyboard.clone(),
+    });
 
     let result = downloader
         .download(DownloadRequest {
@@ -662,16 +664,16 @@ async fn run_download_task(
         cleanup_paths.push(output_path.clone());
 
         let convert_progress = ProgressState::new();
-        let (convert_done_tx, convert_progress_task) = spawn_progress_task(
-            bot.clone(),
+        let (convert_done_tx, convert_progress_task) = spawn_progress_task(ProgressTaskContext {
+            bot: bot.clone(),
             chat_id,
             message_id,
-            convert_progress.clone(),
-            title.clone(),
-            "Converting",
-            cancel.clone(),
-            cancel_keyboard.clone(),
-        );
+            progress: convert_progress.clone(),
+            title: title.clone(),
+            phase: "Converting",
+            cancel: cancel.clone(),
+            keyboard: cancel_keyboard.clone(),
+        });
         let target_kind = target_kind_from_ext(selection.kind, &target.ext);
         let convert_result = convert_with_ffmpeg(
             &input_path,
@@ -1029,7 +1031,7 @@ async fn expire_task_if_state(
         .await;
 }
 
-fn spawn_progress_task(
+struct ProgressTaskContext {
     bot: Bot,
     chat_id: ChatId,
     message_id: MessageId,
@@ -1038,7 +1040,21 @@ fn spawn_progress_task(
     phase: &'static str,
     cancel: Arc<AtomicBool>,
     keyboard: InlineKeyboardMarkup,
+}
+
+fn spawn_progress_task(
+    context: ProgressTaskContext,
 ) -> (tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+    let ProgressTaskContext {
+        bot,
+        chat_id,
+        message_id,
+        progress,
+        title,
+        phase,
+        cancel,
+        keyboard,
+    } = context;
     let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
     let bot_clone = bot.clone();
     let progress_clone = progress.clone();

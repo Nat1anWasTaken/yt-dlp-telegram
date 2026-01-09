@@ -1,0 +1,53 @@
+name: Clippy
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  clippy:
+    name: Clippy Lints
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        id: toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
+
+      - name: Record rustc version
+        id: rustc_version
+        run: echo "version=$(rustc -V)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache cargo directories
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ steps.rustc_version.outputs.version }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run cargo clippy (json report)
+        run: |
+          cargo clippy --all-targets --all-features --message-format=json -- -D warnings | tee clippy.json
+
+      - name: Upload clippy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clippy-report
+          path: clippy.json
+
+      - name: Clippy annotations
+        uses: actions-rs/clippy-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          args: --all-targets --all-features -- -D warnings

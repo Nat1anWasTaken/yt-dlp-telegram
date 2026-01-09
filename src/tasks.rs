@@ -246,6 +246,21 @@ mod tests {
     }
 
     #[test]
+    fn cancel_callback_roundtrip() {
+        let id = TaskId::from_raw("task123");
+        let data = build_cancel_callback(&id);
+        let parsed = parse_cancel_callback(&data).unwrap();
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn cancel_callback_rejects_empty() {
+        assert!(parse_cancel_callback("cancel:").is_none());
+        assert!(parse_cancel_callback("cancel:   ").is_none());
+        assert!(parse_cancel_callback("task:123").is_none());
+    }
+
+    #[test]
     fn registry_insert_get_remove() {
         let registry = TaskRegistry::new();
         let mut formats = HashMap::new();
@@ -265,6 +280,7 @@ mod tests {
             formats,
         );
         let id = task.id.clone();
+        assert!(!task.cancel.load(std::sync::atomic::Ordering::SeqCst));
         registry.insert(task);
         assert!(registry.get(&id).is_some());
         registry.remove(&id);
