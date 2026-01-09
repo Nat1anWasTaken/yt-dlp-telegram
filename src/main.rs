@@ -9,23 +9,27 @@ use std::time::Duration;
 use teloxide::{net::default_reqwest_settings, prelude::*};
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
+use tracing::{Instrument, error, info, instrument, warn};
 
 #[tokio::main]
+#[instrument]
 async fn main() -> Result<(), AppError> {
     if let Err(err) = run().await {
         eprintln!("fatal error: {err}");
-        tracing::error!("fatal error: {err}");
+        error!(event = "fatal_error", error = %err);
         return Err(err);
     }
     Ok(())
 }
 
+#[instrument]
 async fn run() -> Result<(), AppError> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     dotenv::dotenv().ok();
+    info!(event = "startup_begin");
 
     let client = default_reqwest_settings()
         .connect_timeout(Duration::from_secs(10))
@@ -39,45 +43,60 @@ async fn run() -> Result<(), AppError> {
         .dependencies(dptree::deps![services])
         .build();
     let shutdown_token = dispatcher.shutdown_token();
-    tokio::spawn(async move {
-        shutdown_signal().await;
-        if let Ok(wait) = shutdown_token.shutdown() {
-            wait.await;
+    tokio::spawn(
+        async move {
+            shutdown_signal().await;
+            if let Ok(wait) = shutdown_token.shutdown() {
+                wait.await;
+            }
         }
-    });
+        .in_current_span(),
+    );
 
     dispatcher.dispatch().await;
+    info!(event = "dispatcher_exit");
     Ok(())
 }
 
 #[cfg(unix)]
+#[instrument]
 async fn shutdown_signal() {
     let term = signal(SignalKind::terminate());
     let interrupt = signal(SignalKind::interrupt());
     match (term, interrupt) {
         (Ok(mut term), Ok(mut interrupt)) => {
+            info!(event = "shutdown_signal_listening", signal = "term_or_interrupt");
             tokio::select! {
                 _ = term.recv() => {}
                 _ = interrupt.recv() => {}
             }
         }
         (Ok(mut term), Err(err)) => {
-            tracing::warn!("failed to listen for SIGINT: {err}");
+            warn!(event = "signal_listen_failed", signal = "SIGINT", error = %err);
             let _ = term.recv().await;
         }
         (Err(err), Ok(mut interrupt)) => {
-            tracing::warn!("failed to listen for SIGTERM: {err}");
+            warn!(event = "signal_listen_failed", signal = "SIGTERM", error = %err);
             let _ = interrupt.recv().await;
         }
         (Err(term_err), Err(int_err)) => {
-            tracing::warn!("failed to listen for SIGTERM: {term_err}");
-            tracing::warn!("failed to listen for SIGINT: {int_err}");
+            warn!(
+                event = "signal_listen_failed",
+                signal = "SIGTERM",
+                error = %term_err
+            );
+            warn!(
+                event = "signal_listen_failed",
+                signal = "SIGINT",
+                error = %int_err
+            );
             let _ = tokio::signal::ctrl_c().await;
         }
     }
 }
 
 #[cfg(not(unix))]
+#[instrument]
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
