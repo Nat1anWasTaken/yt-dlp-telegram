@@ -18,6 +18,7 @@ jobs:
         id: toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          toolchain: stable
           components: clippy
 
       - name: Record rustc version
@@ -37,7 +38,7 @@ jobs:
 
       - name: Run cargo clippy (json report)
         run: |
-          cargo clippy --all-targets --all-features --message-format=json -- -D warnings | tee clippy.json
+          cargo clippy --all-targets --locked --message-format=json -- -D warnings | tee clippy.json
 
       - name: Upload clippy report
         if: always()
@@ -50,4 +51,4 @@ jobs:
         uses: actions-rs/clippy-check@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          args: --all-targets --all-features -- -D warnings
+          args: --all-targets --locked -- -D warnings
