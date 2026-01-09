@@ -10,6 +10,15 @@ use teloxide::{net::default_reqwest_settings, prelude::*};
 
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
+    if let Err(err) = run().await {
+        eprintln!("fatal error: {err}");
+        tracing::error!("fatal error: {err}");
+        return Err(err);
+    }
+    Ok(())
+}
+
+async fn run() -> Result<(), AppError> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -29,6 +38,5 @@ async fn main() -> Result<(), AppError> {
         .build()
         .dispatch()
         .await;
-
     Ok(())
 }

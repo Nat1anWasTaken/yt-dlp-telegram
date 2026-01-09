@@ -1,0 +1,9 @@
+services:
+  bot:
+    build:
+      context: .
+    env_file:
+      - .env
+    environment:
+      RUST_LOG: info
+    restart: unless-stopped
