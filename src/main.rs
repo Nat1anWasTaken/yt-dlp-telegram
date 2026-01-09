@@ -7,6 +7,8 @@ use crate::error::AppError;
 use handlers::{build_handler, AppServices};
 use std::time::Duration;
 use teloxide::{net::default_reqwest_settings, prelude::*};
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
 
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
@@ -33,10 +35,32 @@ async fn run() -> Result<(), AppError> {
     let handler = build_handler();
     let services = AppServices::new();
 
-    Dispatcher::builder(bot, handler)
+    let mut dispatcher = Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![services])
-        .build()
-        .dispatch()
-        .await;
+        .build();
+    let shutdown_token = dispatcher.shutdown_token();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        if let Ok(wait) = shutdown_token.shutdown() {
+            wait.await;
+        }
+    });
+
+    dispatcher.dispatch().await;
     Ok(())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    let mut term = signal(SignalKind::terminate()).expect("failed to listen for SIGTERM");
+    let mut interrupt = signal(SignalKind::interrupt()).expect("failed to listen for SIGINT");
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = interrupt.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
