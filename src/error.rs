@@ -25,7 +25,4 @@ pub enum AppError {
 
     #[error("Task join error: {0}")]
     JoinError(#[from] tokio::task::JoinError),
-
-    #[error("Internal error: {0}")]
-    Internal(String),
 }

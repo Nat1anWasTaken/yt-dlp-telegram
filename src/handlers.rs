@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use rand::{distributions::Alphanumeric, Rng};
 use serde::Deserialize;
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     fmt::Display,
     path::PathBuf,
     sync::Arc,
@@ -14,7 +14,7 @@ use teloxide::{
     dispatching::DpHandlerDescription,
     prelude::*,
     types::{InlineKeyboardButton, InlineKeyboardMarkup, InputFile, MessageId},
-    RequestError,
+    ApiError, RequestError,
 };
 use tokio::{sync::Mutex, time};
 use tracing::warn;
@@ -79,7 +79,12 @@ pub struct YtDlpFormat {
     pub height: Option<u32>,
     pub width: Option<u32>,
     pub tbr: Option<f64>,
+    pub abr: Option<f64>,
+    pub vcodec: Option<String>,
+    pub acodec: Option<String>,
     pub filesize: Option<u64>,
+    pub filesize_approx: Option<u64>,
+    pub duration: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -171,6 +176,7 @@ async fn handle_url(bot: Bot, services: AppServices, msg_and_url: (Message, Stri
 
     let title = info.title.clone();
     let mut formats = info.formats;
+    let best_format_ids = best_format_ids(&formats);
     formats.sort_by(|a, b| {
         let a_height = a.height.unwrap_or(0);
         let b_height = b.height.unwrap_or(0);
@@ -183,7 +189,8 @@ async fn handle_url(bot: Bot, services: AppServices, msg_and_url: (Message, Stri
 
     let mut rows = Vec::new();
     for format in formats.into_iter().take(8) {
-        let label = format_label(&format);
+        let is_best = best_format_ids.contains(&format.format_id);
+        let label = format_label(&format, is_best);
         let key = generate_key();
         services.state.selections.insert(
             key.clone(),
@@ -254,17 +261,30 @@ async fn handle_callback(bot: Bot, services: AppServices, q: CallbackQuery) -> R
     let progress_task = tokio::spawn(async move {
         let mut ticker = time::interval(PROGRESS_UPDATE_EVERY);
         let mut notified = false;
+        let mut last_text: Option<String> = None;
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
                     let text = progress_clone.build_text(&progress_title).await;
-                    if let Err(err) = bot_clone.edit_message_text(chat_id, message_id, text).await {
-                        tracing::warn!("Failed to edit progress message: {err}");
-                        if !notified {
-                            let _ = bot_clone
-                                .send_message(chat_id, format!("Progress update failed.\nError: {err}"))
-                                .await;
-                            notified = true;
+                    if last_text.as_deref() == Some(text.as_str()) {
+                        continue;
+                    }
+                    match bot_clone.edit_message_text(chat_id, message_id, text.clone()).await {
+                        Ok(_) => {
+                            last_text = Some(text);
+                        }
+                        Err(err) => {
+                            if is_message_not_modified(&err) {
+                                last_text = Some(text);
+                                continue;
+                            }
+                            tracing::warn!("Failed to edit progress message: {err}");
+                            if !notified {
+                                let _ = bot_clone
+                                    .send_message(chat_id, format!("Progress update failed.\nError: {err}"))
+                                    .await;
+                                notified = true;
+                            }
                         }
                     }
                 }
@@ -296,7 +316,7 @@ async fn handle_callback(bot: Bot, services: AppServices, q: CallbackQuery) -> R
             }
             let data = bytes::Bytes::from(data);
             let filename = filename.clone();
-            if let Err(err) = send_document_with_retry(&bot, chat_id, move || {
+            if let Err(err) = upload_with_progress(&bot, chat_id, message_id, move || {
                 InputFile::memory(data.clone()).file_name(filename.clone())
             })
             .await
@@ -312,7 +332,7 @@ async fn handle_callback(bot: Bot, services: AppServices, q: CallbackQuery) -> R
             }
             let path_for_upload = path.clone();
             let filename_for_upload = filename.clone();
-            if let Err(err) = send_document_with_retry(&bot, chat_id, move || {
+            if let Err(err) = upload_with_progress(&bot, chat_id, message_id, move || {
                 InputFile::file(path_for_upload.clone()).file_name(filename_for_upload.clone())
             })
             .await
@@ -329,6 +349,55 @@ async fn handle_callback(bot: Bot, services: AppServices, q: CallbackQuery) -> R
     }
 
     Ok(())
+}
+
+async fn upload_with_progress<F>(
+    bot: &Bot,
+    chat_id: ChatId,
+    message_id: MessageId,
+    make_file: F,
+) -> Result<(), AppError>
+where
+    F: Fn() -> InputFile,
+{
+    let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
+    let bot_clone = bot.clone();
+    let started_at = time::Instant::now();
+    let progress_task = tokio::spawn(async move {
+        let mut ticker = time::interval(PROGRESS_UPDATE_EVERY);
+        let mut last_text: Option<String> = None;
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let elapsed = started_at.elapsed().as_secs();
+                    let text = format!("Uploading… {}s elapsed", elapsed);
+                    if last_text.as_deref() == Some(text.as_str()) {
+                        continue;
+                    }
+                    match bot_clone.edit_message_text(chat_id, message_id, text.clone()).await {
+                        Ok(_) => {
+                            last_text = Some(text);
+                        }
+                        Err(err) => {
+                            if is_message_not_modified(&err) {
+                                last_text = Some(text);
+                                continue;
+                            }
+                            tracing::warn!("Failed to edit upload progress message: {err}");
+                        }
+                    }
+                }
+                _ = done_rx.changed() => {
+                    break;
+                }
+            }
+        }
+    });
+
+    let result = send_document_with_retry(bot, chat_id, make_file).await;
+    let _ = done_tx.send(true);
+    let _ = progress_task.await;
+    result
 }
 
 async fn send_document_with_retry<F>(bot: &Bot, chat_id: ChatId, make_file: F) -> Result<(), AppError>
@@ -375,6 +444,10 @@ fn retry_delay_for_upload(err: &RequestError, attempt: usize) -> Option<Duration
     }
 }
 
+fn is_message_not_modified(err: &RequestError) -> bool {
+    matches!(err, RequestError::Api(ApiError::MessageNotModified))
+}
+
 async fn report_user_error(
     bot: &Bot,
     chat_id: ChatId,
@@ -389,7 +462,7 @@ async fn report_user_error(
     Ok(())
 }
 
-fn format_label(format: &YtDlpFormat) -> String {
+fn format_label(format: &YtDlpFormat, is_best: bool) -> String {
     let mut parts = Vec::new();
     if let Some(height) = format.height {
         if let Some(width) = format.width {
@@ -398,20 +471,107 @@ fn format_label(format: &YtDlpFormat) -> String {
             parts.push(format!("{height}p"));
         }
     }
+    if let Some(kind) = format_kind(format) {
+        parts.push(kind.to_string());
+    }
     if let Some(note) = &format.format_note {
         parts.push(note.clone());
     }
     if let Some(ext) = &format.ext {
         parts.push(ext.clone());
     }
+    if let Some(bitrate) = format_bitrate_kbps(format) {
+        parts.push(format!("{bitrate:.0} kbps"));
+    }
     if let Some(size) = format.filesize {
         parts.push(human_size(size));
     }
-    if parts.is_empty() {
+    let label = if parts.is_empty() {
         format.format_id.clone()
     } else {
         format!("{} ({})", format.format_id, parts.join(" · "))
+    };
+    if is_best {
+        format!("⭐ {label}")
+    } else {
+        label
     }
+}
+
+fn format_kind(format: &YtDlpFormat) -> Option<&'static str> {
+    let vcodec = format.vcodec.as_deref();
+    let acodec = format.acodec.as_deref();
+    let v_none = matches!(vcodec, None | Some("none"));
+    let a_none = matches!(acodec, None | Some("none"));
+    let ext = format.ext.as_deref();
+
+    if is_image_ext(ext) && v_none && a_none {
+        return Some("image");
+    }
+    if v_none && !a_none {
+        return Some("audio only");
+    }
+    if a_none && !v_none {
+        return Some("video only");
+    }
+    if !v_none || !a_none {
+        return Some("video+audio");
+    }
+    None
+}
+
+fn best_format_ids(formats: &[YtDlpFormat]) -> HashSet<String> {
+    let mut best: HashMap<String, (i64, i64, i64, String)> = HashMap::new();
+    for format in formats {
+        let ext = format.ext.clone().unwrap_or_else(|| "unknown".to_string());
+        let key = format_quality_key(format);
+        let entry = best.entry(ext).or_insert_with(|| {
+            (key.0, key.1, key.2, format.format_id.clone())
+        });
+        if (key.0, key.1, key.2) > (entry.0, entry.1, entry.2) {
+            *entry = (key.0, key.1, key.2, format.format_id.clone());
+        }
+    }
+    best.into_values().map(|(_, _, _, id)| id).collect()
+}
+
+fn format_quality_key(format: &YtDlpFormat) -> (i64, i64, i64) {
+    let height = format.height.unwrap_or(0) as i64;
+    let bitrate = format_bitrate_kbps(format).unwrap_or(0.0);
+    let bitrate_scaled = (bitrate * 100.0) as i64;
+    let size = format.filesize.or(format.filesize_approx).unwrap_or(0) as i64;
+    (height, bitrate_scaled, size)
+}
+
+fn format_bitrate_kbps(format: &YtDlpFormat) -> Option<f64> {
+    if let Some(abr) = format.abr {
+        if abr > 0.0 {
+            return Some(abr);
+        }
+    }
+    if let Some(tbr) = format.tbr {
+        if tbr > 0.0 {
+            return Some(tbr);
+        }
+    }
+    let duration = format.duration?;
+    if duration <= 0.0 {
+        return None;
+    }
+    let bytes = format.filesize.or(format.filesize_approx)?;
+    let kbps = (bytes as f64 * 8.0) / duration / 1000.0;
+    if kbps > 0.0 {
+        Some(kbps)
+    } else {
+        None
+    }
+}
+
+fn is_image_ext(ext: Option<&str>) -> bool {
+    matches!(
+        ext,
+        Some("jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" | "tiff" | "tif" | "svg" | "avif" | "heic" | "heif")
+    )
 }
 
 fn human_size(bytes: u64) -> String {
