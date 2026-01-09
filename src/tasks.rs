@@ -244,17 +244,17 @@ mod tests {
     fn callback_roundtrip() {
         let id = TaskId::from_raw("task123");
         let data = build_task_callback(&id, "140");
-        let parsed = parse_task_callback(&data).unwrap();
-        assert_eq!(parsed.0, id);
-        assert_eq!(parsed.1, "140");
+        assert_eq!(
+            parse_task_callback(&data),
+            Some((id, "140".to_string()))
+        );
     }
 
     #[test]
     fn cancel_callback_roundtrip() {
         let id = TaskId::from_raw("task123");
         let data = build_cancel_callback(&id);
-        let parsed = parse_cancel_callback(&data).unwrap();
-        assert_eq!(parsed, id);
+        assert_eq!(parse_cancel_callback(&data), Some(id));
     }
 
     #[test]
