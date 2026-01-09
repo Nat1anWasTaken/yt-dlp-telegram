@@ -58,9 +58,6 @@ jobs:
       - name: Run tests
         run: cargo test --locked --verbose
 
-      - name: Run doc tests
-        run: cargo test --doc --locked --verbose
-
   build:
     name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
