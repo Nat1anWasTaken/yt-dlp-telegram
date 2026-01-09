@@ -1,7 +1,8 @@
 use crate::error::AppError;
 use crate::tasks::{
-    build_target_callback, build_task_callback, parse_target_callback, parse_task_callback, DownloadTask,
-    FormatMeta, FormatSelection, MediaKind, TargetFormat, TaskId, TaskOutcome, TaskRegistry, TaskState,
+    build_cancel_callback, build_target_callback, build_task_callback, parse_cancel_callback,
+    parse_target_callback, parse_task_callback, DownloadTask, FormatMeta, FormatSelection, MediaKind,
+    TargetFormat, TaskId, TaskOutcome, TaskRegistry, TaskState,
 };
 use crate::yt_dlp::{Downloader, MediaProvider, YtDlpClient};
 use rand::{distributions::Alphanumeric, Rng};
@@ -11,7 +12,10 @@ use std::{
     fmt::Display,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use teloxide::{
@@ -26,6 +30,7 @@ use tracing::warn;
 pub const MAX_IN_MEMORY_BYTES: usize = 50 * 1024 * 1024; // 50MB
 const PROGRESS_LINES: usize = 6;
 pub const PROGRESS_UPDATE_EVERY: Duration = Duration::from_secs(2);
+const SELECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const UPLOAD_MAX_RETRIES: usize = 3;
 const UPLOAD_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 const UPLOAD_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
@@ -139,10 +144,8 @@ pub struct DownloadRequest {
     pub url: String,
     pub format_id: String,
     pub progress: ProgressState,
+    pub cancel: Arc<AtomicBool>,
 }
-
-type TargetSelectionResult =
-    Result<(String, Option<String>, Option<String>, FormatSelection, TargetFormat), &'static str>;
 
 struct RunDownloadContext {
     task_id: TaskId,
@@ -153,6 +156,7 @@ struct RunDownloadContext {
     author: Option<String>,
     selection: FormatSelection,
     target: TargetFormat,
+    cancel: Arc<AtomicBool>,
 }
 
 pub fn build_handler() -> Handler<'static, DependencyMap, Result<(), AppError>, DpHandlerDescription> {
@@ -234,6 +238,10 @@ async fn handle_url(bot: Bot, services: AppServices, msg_and_url: (Message, Stri
         return Ok(())
     }
 
+    rows.push(vec![InlineKeyboardButton::callback(
+        "Cancel",
+        build_cancel_callback(&task_id),
+    )]);
     let keyboard = InlineKeyboardMarkup::new(rows);
     let mut text = "Select a format:".to_string();
     if let Some(title) = title {
@@ -243,6 +251,14 @@ async fn handle_url(bot: Bot, services: AppServices, msg_and_url: (Message, Stri
     bot.edit_message_text(chat_id, placeholder.id, text)
         .reply_markup(keyboard)
         .await?;
+
+    spawn_waiting_format_timeout(
+        bot.clone(),
+        services.state.tasks.clone(),
+        task_id,
+        chat_id,
+        placeholder.id,
+    );
     Ok(())
 }
 
@@ -253,7 +269,9 @@ async fn handle_callback(bot: Bot, services: AppServices, q: CallbackQuery) -> R
     };
     let chat_id = message.chat.id;
 
-    if let Some((task_id, format_id)) = parse_task_callback(&data) {
+    if let Some(task_id) = parse_cancel_callback(&data) {
+        handle_cancel_task(&bot, services, q, message.id, chat_id, task_id).await
+    } else if let Some((task_id, format_id)) = parse_task_callback(&data) {
         handle_format_selection(&bot, services, q, message.id, chat_id, task_id, format_id).await
     } else if let Some((task_id, target_ext)) = parse_target_callback(&data) {
         handle_target_selection(&bot, services, q, message.id, chat_id, task_id, target_ext).await
@@ -322,17 +340,20 @@ async fn handle_format_selection(
         return Ok(());
     }
 
-    let keyboard = InlineKeyboardMarkup::new(
-        targets
-            .iter()
-            .map(|target| {
-                vec![InlineKeyboardButton::callback(
-                    target_label(&selection.kind, &target.ext),
-                    build_target_callback(&task_id, &target.ext),
-                )]
-            })
-            .collect::<Vec<_>>(),
-    );
+    let mut rows = targets
+        .iter()
+        .map(|target| {
+            vec![InlineKeyboardButton::callback(
+                target_label(&selection.kind, &target.ext),
+                build_target_callback(&task_id, &target.ext),
+            )]
+        })
+        .collect::<Vec<_>>();
+    rows.push(vec![InlineKeyboardButton::callback(
+        "Cancel",
+        build_cancel_callback(&task_id),
+    )]);
+    let keyboard = InlineKeyboardMarkup::new(rows);
 
     let mut text = "Select an output format:".to_string();
     if let Some(title) = title {
@@ -342,6 +363,14 @@ async fn handle_format_selection(
     bot.edit_message_text(chat_id, message_id, text)
         .reply_markup(keyboard)
         .await?;
+
+    spawn_target_selection_timeout(
+        bot.clone(),
+        services.state.tasks.clone(),
+        task_id,
+        chat_id,
+        message_id,
+    );
     Ok(())
 }
 
@@ -360,7 +389,17 @@ async fn handle_target_selection(
         return Ok(());
     };
 
-    let selection_result: TargetSelectionResult = {
+    let selection_result: Result<
+        (
+            String,
+            Option<String>,
+            Option<String>,
+            FormatSelection,
+            TargetFormat,
+            Arc<AtomicBool>,
+        ),
+        &'static str,
+    > = {
         let mut task = task.lock().await;
         if task.message_id != message_id || task.chat_id != chat_id {
             Err("Task mismatch. Try again.")
@@ -381,6 +420,7 @@ async fn handle_target_selection(
                     task.author.clone(),
                     selection,
                     target,
+                    task.cancel.clone(),
                 ))
             } else {
                 Err("Format expired. Try again.")
@@ -390,7 +430,7 @@ async fn handle_target_selection(
         }
     };
 
-    let (url, title, author, selection, target) = match selection_result {
+    let (url, title, author, selection, target, cancel) = match selection_result {
         Ok(data) => data,
         Err(error_message) => {
             bot.edit_message_text(chat_id, message_id, error_message)
@@ -415,11 +455,58 @@ async fn handle_target_selection(
         author,
         selection,
         target,
+        cancel,
     };
     tokio::spawn(async move {
         run_download_task(bot_clone, registry, downloader, context).await;
     });
 
+    Ok(())
+}
+
+async fn handle_cancel_task(
+    bot: &Bot,
+    services: AppServices,
+    q: CallbackQuery,
+    message_id: MessageId,
+    chat_id: ChatId,
+    task_id: TaskId,
+) -> Result<(), AppError> {
+    let Some(task) = services.state.tasks.get(&task_id) else {
+        bot.edit_message_text(chat_id, message_id, "Task expired. Try again.")
+            .await?;
+        return Ok(());
+    };
+
+    let mut remove_now = false;
+    let mut mismatch = false;
+    {
+        let mut task = task.lock().await;
+        if task.message_id != message_id || task.chat_id != chat_id {
+            mismatch = true;
+        } else {
+            task.cancel.store(true, Ordering::SeqCst);
+            remove_now = matches!(
+                task.state,
+                TaskState::WaitingFormat { .. } | TaskState::SelectingTarget { .. }
+            );
+            task.state = TaskState::Finished {
+                outcome: TaskOutcome::Cancelled,
+            };
+        }
+    }
+
+    if mismatch {
+        bot.edit_message_text(chat_id, message_id, "Task mismatch. Try again.")
+            .await?;
+        return Ok(());
+    }
+
+    bot.answer_callback_query(q.id).await?;
+    if remove_now {
+        let _ = services.state.tasks.remove(&task_id);
+    }
+    let _ = bot.edit_message_text(chat_id, message_id, "Cancelled.").await;
     Ok(())
 }
 
@@ -438,8 +525,13 @@ async fn run_download_task(
         author,
         selection,
         target,
+        cancel,
     } = context;
     let _guard = registry.guard(task_id.clone());
+    if is_cancelled(&cancel) {
+        let _ = bot.edit_message_text(chat_id, message_id, "Cancelled.").await;
+        return;
+    }
     set_task_state(
         &registry,
         &task_id,
@@ -451,6 +543,11 @@ async fn run_download_task(
     .await;
 
     let progress = ProgressState::new();
+    let cancel_keyboard = cancel_keyboard(&task_id);
+    let _ = bot
+        .edit_message_text(chat_id, message_id, "Downloading…")
+        .reply_markup(cancel_keyboard.clone())
+        .await;
     let (done_tx, progress_task) = spawn_progress_task(
         bot.clone(),
         chat_id,
@@ -458,6 +555,8 @@ async fn run_download_task(
         progress.clone(),
         title.clone(),
         "Downloading",
+        cancel.clone(),
+        cancel_keyboard.clone(),
     );
 
     let result = downloader
@@ -465,6 +564,7 @@ async fn run_download_task(
             url,
             format_id: selection.format_id.clone(),
             progress,
+            cancel: cancel.clone(),
         })
         .await;
 
@@ -473,6 +573,18 @@ async fn run_download_task(
 
     let download_result = match result {
         Ok(result) => result,
+        Err(AppError::Cancelled) => {
+            set_task_state(
+                &registry,
+                &task_id,
+                TaskState::Finished {
+                    outcome: TaskOutcome::Cancelled,
+                },
+            )
+            .await;
+            let _ = bot.edit_message_text(chat_id, message_id, "Cancelled.").await;
+            return;
+        }
         Err(err) => {
             let err_text = err.to_string();
             let _ = report_user_error(&bot, chat_id, message_id, "Download failed.", &err).await;
@@ -495,6 +607,19 @@ async fn run_download_task(
         &selection.format_id,
     );
 
+    if is_cancelled(&cancel) {
+        set_task_state(
+            &registry,
+            &task_id,
+            TaskState::Finished {
+                outcome: TaskOutcome::Cancelled,
+            },
+        )
+        .await;
+        let _ = bot.edit_message_text(chat_id, message_id, "Cancelled.").await;
+        return;
+    }
+
     let needs_conversion = selection
         .ext
         .as_deref()
@@ -511,7 +636,10 @@ async fn run_download_task(
             },
         )
         .await;
-        let _ = bot.edit_message_text(chat_id, message_id, "Converting…").await;
+        let _ = bot
+            .edit_message_text(chat_id, message_id, "Converting…")
+            .reply_markup(cancel_keyboard.clone())
+            .await;
 
         let mut cleanup_paths: Vec<PathBuf> = Vec::new();
         let input_path = match download_result {
@@ -541,14 +669,35 @@ async fn run_download_task(
             convert_progress.clone(),
             title.clone(),
             "Converting",
+            cancel.clone(),
+            cancel_keyboard.clone(),
         );
         let target_kind = target_kind_from_ext(selection.kind, &target.ext);
-        let convert_result =
-            convert_with_ffmpeg(&input_path, &output_path, target_kind, convert_progress).await;
+        let convert_result = convert_with_ffmpeg(
+            &input_path,
+            &output_path,
+            target_kind,
+            convert_progress,
+            cancel.clone(),
+        )
+        .await;
         let _ = convert_done_tx.send(true);
         let _ = convert_progress_task.await;
 
         if let Err(err) = convert_result {
+            if matches!(err, AppError::Cancelled) {
+                set_task_state(
+                    &registry,
+                    &task_id,
+                    TaskState::Finished {
+                        outcome: TaskOutcome::Cancelled,
+                    },
+                )
+                .await;
+                let _ = bot.edit_message_text(chat_id, message_id, "Cancelled.").await;
+                cleanup_paths_cleanup(cleanup_paths).await;
+                return;
+            }
             let err_text = err.to_string();
             let _ = report_user_error(&bot, chat_id, message_id, "Conversion failed.", &err).await;
             set_task_state(
@@ -572,6 +721,19 @@ async fn run_download_task(
             },
         )
         .await;
+        if is_cancelled(&cancel) {
+            let _ = bot.edit_message_text(chat_id, message_id, "Cancelled.").await;
+            cleanup_paths_cleanup(cleanup_paths).await;
+            set_task_state(
+                &registry,
+                &task_id,
+                TaskState::Finished {
+                    outcome: TaskOutcome::Cancelled,
+                },
+            )
+            .await;
+            return;
+        }
         if let Err(err) = bot.edit_message_text(chat_id, message_id, "Uploading…").await {
             let _ = report_user_error(&bot, chat_id, message_id, "Failed to update status.", err).await;
             cleanup_paths_cleanup(cleanup_paths).await;
@@ -596,6 +758,18 @@ async fn run_download_task(
             },
         )
         .await;
+        if is_cancelled(&cancel) {
+            let _ = bot.edit_message_text(chat_id, message_id, "Cancelled.").await;
+            set_task_state(
+                &registry,
+                &task_id,
+                TaskState::Finished {
+                    outcome: TaskOutcome::Cancelled,
+                },
+            )
+            .await;
+            return;
+        }
         if let Err(err) = bot.edit_message_text(chat_id, message_id, "Uploading…").await {
             let _ = report_user_error(&bot, chat_id, message_id, "Failed to update status.", err).await;
             return;
@@ -766,6 +940,95 @@ fn is_message_not_modified(err: &RequestError) -> bool {
     matches!(err, RequestError::Api(ApiError::MessageNotModified))
 }
 
+fn is_cancelled(cancel: &Arc<AtomicBool>) -> bool {
+    cancel.load(Ordering::SeqCst)
+}
+
+fn cancel_keyboard(task_id: &TaskId) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+        "Cancel",
+        build_cancel_callback(task_id),
+    )]])
+}
+
+fn spawn_waiting_format_timeout(
+    bot: Bot,
+    registry: TaskRegistry,
+    task_id: TaskId,
+    chat_id: ChatId,
+    message_id: MessageId,
+) {
+    tokio::spawn(async move {
+        time::sleep(SELECTION_TIMEOUT).await;
+        expire_task_if_state(
+            &bot,
+            &registry,
+            &task_id,
+            chat_id,
+            message_id,
+            |state| matches!(state, TaskState::WaitingFormat { .. }),
+        )
+        .await;
+    });
+}
+
+fn spawn_target_selection_timeout(
+    bot: Bot,
+    registry: TaskRegistry,
+    task_id: TaskId,
+    chat_id: ChatId,
+    message_id: MessageId,
+) {
+    tokio::spawn(async move {
+        time::sleep(SELECTION_TIMEOUT).await;
+        expire_task_if_state(
+            &bot,
+            &registry,
+            &task_id,
+            chat_id,
+            message_id,
+            |state| matches!(state, TaskState::SelectingTarget { .. }),
+        )
+        .await;
+    });
+}
+
+async fn expire_task_if_state(
+    bot: &Bot,
+    registry: &TaskRegistry,
+    task_id: &TaskId,
+    chat_id: ChatId,
+    message_id: MessageId,
+    matches_state: impl FnOnce(&TaskState) -> bool,
+) {
+    let Some(task) = registry.get(task_id) else {
+        return;
+    };
+
+    let should_expire = {
+        let mut task = task.lock().await;
+        if task.message_id != message_id || task.chat_id != chat_id {
+            false
+        } else if matches_state(&task.state) {
+            task.state = TaskState::Finished {
+                outcome: TaskOutcome::Failed("Selection timed out".to_string()),
+            };
+            true
+        } else {
+            false
+        }
+    };
+
+    if !should_expire {
+        return;
+    }
+
+    let _ = registry.remove(task_id);
+    let _ = bot
+        .edit_message_text(chat_id, message_id, "Selection timed out. Send the link again.")
+        .await;
+}
+
 fn spawn_progress_task(
     bot: Bot,
     chat_id: ChatId,
@@ -773,12 +1036,15 @@ fn spawn_progress_task(
     progress: ProgressState,
     title: Option<String>,
     phase: &'static str,
+    cancel: Arc<AtomicBool>,
+    keyboard: InlineKeyboardMarkup,
 ) -> (tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<()>) {
     let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
     let bot_clone = bot.clone();
     let progress_clone = progress.clone();
     let progress_title = title.clone();
     let phase_label = phase.to_string();
+    let keyboard = keyboard.clone();
     let progress_task = tokio::spawn(async move {
         let mut ticker = time::interval(PROGRESS_UPDATE_EVERY);
         let mut notified = false;
@@ -786,11 +1052,18 @@ fn spawn_progress_task(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
+                    if is_cancelled(&cancel) {
+                        break;
+                    }
                     let text = progress_clone.build_text(&phase_label, &progress_title).await;
                     if last_text.as_deref() == Some(text.as_str()) {
                         continue;
                     }
-                    match bot_clone.edit_message_text(chat_id, message_id, text.clone()).await {
+                    match bot_clone
+                        .edit_message_text(chat_id, message_id, text.clone())
+                        .reply_markup(keyboard.clone())
+                        .await
+                    {
                         Ok(_) => {
                             last_text = Some(text);
                         }
@@ -861,6 +1134,7 @@ async fn convert_with_ffmpeg(
     output: &Path,
     kind: MediaKind,
     progress: ProgressState,
+    cancel: Arc<AtomicBool>,
 ) -> Result<(), AppError> {
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y").arg("-i").arg(input);
@@ -889,7 +1163,22 @@ async fn convert_with_ffmpeg(
     let stdout_task = tokio::spawn(stream_process_output(stdout, progress.clone()));
     let stderr_task = tokio::spawn(stream_process_output(stderr, progress));
 
-    let status = child.wait().await.map_err(AppError::Io)?;
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => {
+                break status.map_err(AppError::Io)?;
+            }
+            _ = time::sleep(Duration::from_millis(200)) => {
+                if is_cancelled(&cancel) {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    let _ = stdout_task.await;
+                    let _ = stderr_task.await;
+                    return Err(AppError::Cancelled);
+                }
+            }
+        }
+    };
     let stdout_result = stdout_task.await?;
     let stderr_result = stderr_task.await?;
 

@@ -8,6 +8,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
 };
+use std::sync::atomic::Ordering;
 
 #[derive(Default)]
 pub struct YtDlpClient;
@@ -90,9 +91,25 @@ async fn download_with_progress(req: DownloadRequest) -> Result<DownloadResult, 
     let mut chunk = vec![0u8; 64 * 1024];
 
     loop {
+        if req.cancel.load(Ordering::SeqCst) {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            if let Some(path) = temp_path.as_ref() {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+            return Err(AppError::Cancelled);
+        }
         let read = reader.read(&mut chunk).await.map_err(AppError::Io)?;
         if read == 0 {
             break;
+        }
+        if req.cancel.load(Ordering::SeqCst) {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            if let Some(path) = temp_path.as_ref() {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+            return Err(AppError::Cancelled);
         }
         if temp_file.is_none() && buffer.len() + read <= crate::handlers::MAX_IN_MEMORY_BYTES {
             buffer.extend_from_slice(&chunk[..read]);

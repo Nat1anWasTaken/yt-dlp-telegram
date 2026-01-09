@@ -26,6 +26,9 @@ pub enum AppError {
     #[error("ffmpeg failed with exit code: {0}")]
     FfmpegFailed(std::process::ExitStatus),
 
+    #[error("Task cancelled")]
+    Cancelled,
+
     #[error("Task join error: {0}")]
     JoinError(#[from] tokio::task::JoinError),
 }

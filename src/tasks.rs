@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     fmt,
     hash::{Hash, Hasher},
-    sync::Arc,
+    sync::{atomic::AtomicBool, Arc},
 };
 use teloxide::types::{ChatId, MessageId};
 use tokio::sync::Mutex;
@@ -102,6 +102,7 @@ pub enum TaskState {
 pub enum TaskOutcome {
     Success,
     Failed(String),
+    Cancelled,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +114,7 @@ pub struct DownloadTask {
     pub title: Option<String>,
     pub author: Option<String>,
     pub state: TaskState,
+    pub cancel: Arc<AtomicBool>,
 }
 
 impl DownloadTask {
@@ -132,6 +134,7 @@ impl DownloadTask {
             title,
             author,
             state: TaskState::WaitingFormat { formats },
+            cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -212,6 +215,21 @@ pub fn parse_target_callback(data: &str) -> Option<(TaskId, String)> {
         return None;
     }
     Some((TaskId::from_raw(task_id), ext.to_string()))
+}
+
+const CANCEL_CALLBACK_PREFIX: &str = "cancel:";
+
+pub fn build_cancel_callback(id: &TaskId) -> String {
+    format!("{CANCEL_CALLBACK_PREFIX}{}", id.as_str())
+}
+
+pub fn parse_cancel_callback(data: &str) -> Option<TaskId> {
+    let payload = data.strip_prefix(CANCEL_CALLBACK_PREFIX)?;
+    let task_id = payload.trim();
+    if task_id.is_empty() {
+        return None;
+    }
+    Some(TaskId::from_raw(task_id))
 }
 
 #[cfg(test)]
