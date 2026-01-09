@@ -26,7 +26,7 @@ use teloxide::{
     types::{InlineKeyboardButton, InlineKeyboardMarkup, InputFile, MessageId},
 };
 use tokio::{io::AsyncReadExt, process::Command, sync::Mutex, time};
-use tracing::warn;
+use tracing::{debug, error, info, warn, instrument, Instrument};
 
 pub const MAX_IN_MEMORY_BYTES: usize = 50 * 1024 * 1024; // 50MB
 const PROGRESS_LINES: usize = 6;
@@ -72,17 +72,24 @@ pub struct AppServices {
 impl AppServices {
     pub fn new() -> Self {
         let yt_dlp = Arc::new(YtDlpClient);
+        let allowed_user_ids = read_allowed_user_ids();
+        if let Some(ref ids) = allowed_user_ids {
+            info!(user_count = ids.len(), "User access control enabled");
+        } else {
+            warn!("No user access control configured - bot is open to all users");
+        }
         Self {
             state: AppState::default(),
             media: yt_dlp.clone(),
             downloader: yt_dlp,
-            allowed_user_ids: read_allowed_user_ids(),
+            allowed_user_ids,
         }
     }
 }
 
 fn read_allowed_user_ids() -> Option<HashSet<u64>> {
     let raw = env::var("ALLOWED_USER_IDS").ok()?;
+    debug!(raw_config = %raw, "Parsing ALLOWED_USER_IDS configuration");
     let mut ids = HashSet::new();
     for entry in raw.split(',') {
         let trimmed = entry.trim();
@@ -91,29 +98,50 @@ fn read_allowed_user_ids() -> Option<HashSet<u64>> {
         }
         match trimmed.parse::<u64>() {
             Ok(id) => {
+                debug!(user_id = id, "Added user ID to allowed list");
                 ids.insert(id);
             }
             Err(err) => {
-                warn!("Ignoring invalid ALLOWED_USER_IDS entry '{trimmed}': {err}");
+                warn!(entry = %trimmed, error = %err, "Invalid ALLOWED_USER_IDS entry ignored");
             }
         }
     }
-    if ids.is_empty() { None } else { Some(ids) }
+    if ids.is_empty() {
+        debug!("ALLOWED_USER_IDS is empty after parsing");
+        None
+    } else {
+        debug!(count = ids.len(), "Parsed allowed user IDs successfully");
+        Some(ids)
+    }
 }
 
 fn is_user_allowed(allowed_user_ids: &Option<HashSet<u64>>, user_id: u64) -> bool {
-    allowed_user_ids
+    let allowed = allowed_user_ids
         .as_ref()
         .map(|allowed| allowed.contains(&user_id))
-        .unwrap_or(true)
+        .unwrap_or(true);
+
+    if !allowed {
+        warn!(user_id = user_id, "Unauthorized user access attempt");
+    } else {
+        debug!(user_id = user_id, "User authorization check passed");
+    }
+    allowed
 }
 
+#[instrument(skip(bot), fields(chat_id = %chat_id, user_id = user_id))]
 async fn reject_user(bot: &Bot, chat_id: ChatId, user_id: u64) -> Result<(), AppError> {
+    warn!(user_id = user_id, chat_id = %chat_id, "Rejecting unauthorized user");
     bot.send_message(
         chat_id,
         format!("You do not have permission to use this bot. Your user ID is: {user_id}"),
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        error!(error = %e, user_id = user_id, "Failed to send rejection message");
+        e
+    })?;
+    info!(user_id = user_id, "Rejection message sent successfully");
     Ok(())
 }
 
@@ -252,6 +280,7 @@ fn message_user_id(msg: &Message) -> u64 {
         .unwrap_or_else(|| u64::try_from(msg.chat.id.0).unwrap_or_default())
 }
 
+#[instrument(skip(bot, services, msg_and_url), fields(chat_id, user_id, url = %msg_and_url.1))]
 async fn handle_url(
     bot: Bot,
     services: AppServices,
@@ -260,16 +289,30 @@ async fn handle_url(
     let (msg, url) = msg_and_url;
     let chat_id = msg.chat.id;
     let user_id = message_user_id(&msg);
+
+    info!(url = %url, chat_id = %chat_id, user_id = user_id, "Processing URL from user");
+
     if !is_user_allowed(&services.allowed_user_ids, user_id) {
         reject_user(&bot, chat_id, user_id).await?;
         return Ok(());
     }
-    let placeholder = bot.send_message(chat_id, "Inspecting URL…").await?;
 
+    debug!("Sending inspection placeholder message");
+    let placeholder = bot.send_message(chat_id, "Inspecting URL…").await
+        .map_err(|e| {
+            error!(error = %e, "Failed to send placeholder message");
+            e
+        })?;
+
+    debug!("Fetching media formats from URL");
     let info = services.media.fetch_formats(&url).await;
     let info = match info {
-        Ok(info) => info,
+        Ok(info) => {
+            info!(format_count = info.formats.len(), title = ?info.title, "Fetched media formats successfully");
+            info
+        }
         Err(err) => {
+            error!(error = %err, url = %url, "Failed to fetch media formats");
             report_user_error(&bot, chat_id, placeholder.id, "Failed to inspect URL.", err).await?;
             return Ok(());
         }
@@ -309,6 +352,7 @@ async fn handle_url(
         formats_map,
     );
     let task_id = task.id.clone();
+    info!(task_id = %task_id, format_count = formats.len().min(8), "Created download task");
     services.state.tasks.insert(task);
 
     let mut rows = Vec::new();
@@ -320,6 +364,7 @@ async fn handle_url(
     }
 
     if rows.is_empty() {
+        warn!(task_id = %task_id, "No formats available for download");
         bot.edit_message_text(chat_id, placeholder.id, "No formats found.")
             .await?;
         return Ok(());
@@ -335,59 +380,82 @@ async fn handle_url(
         text = format!("Select a format for:\n{title}");
     }
 
+    debug!(task_id = %task_id, "Displaying format selection keyboard");
     bot.edit_message_text(chat_id, placeholder.id, text)
         .reply_markup(keyboard)
-        .await?;
+        .await
+        .map_err(|e| {
+            error!(error = %e, task_id = %task_id, "Failed to display format selection");
+            e
+        })?;
 
     spawn_waiting_format_timeout(
         bot.clone(),
         services.state.tasks.clone(),
-        task_id,
+        task_id.clone(),
         chat_id,
         placeholder.id,
     );
+    info!(task_id = %task_id, "Format selection displayed successfully");
     Ok(())
 }
 
+#[instrument(skip(bot, services, msg), fields(chat_id = %msg.chat.id, user_id))]
 async fn handle_non_url(bot: Bot, services: AppServices, msg: Message) -> Result<(), AppError> {
     let chat_id = msg.chat.id;
     let user_id = message_user_id(&msg);
+
+    debug!(chat_id = %chat_id, user_id = user_id, "Received non-URL message");
+
     if !is_user_allowed(&services.allowed_user_ids, user_id) {
         reject_user(&bot, chat_id, user_id).await?;
         return Ok(());
     }
+
+    debug!("Sending help message");
     bot.send_message(chat_id, "Send any URL.").await?;
     Ok(())
 }
 
+#[instrument(skip(bot, services, q), fields(user_id = q.from.id.0, callback_data = %q.data.as_deref().unwrap_or("")))]
 async fn handle_callback(
     bot: Bot,
     services: AppServices,
     q: CallbackQuery,
 ) -> Result<(), AppError> {
     let data = q.data.clone().unwrap_or_default();
+    debug!(callback_data = %data, "Processing callback query");
+
     let Some(message) = q.message.clone() else {
+        debug!("Callback query has no message, ignoring");
         return Ok(());
     };
     let chat_id = message.chat.id;
     let user_id = q.from.id.0;
+
     if !is_user_allowed(&services.allowed_user_ids, user_id) {
+        warn!(user_id = user_id, "Unauthorized callback query attempt");
         bot.answer_callback_query(q.id).await?;
         reject_user(&bot, chat_id, user_id).await?;
         return Ok(());
     }
 
     if let Some(task_id) = parse_cancel_callback(&data) {
+        debug!(task_id = %task_id, "Routing to cancel task handler");
         handle_cancel_task(&bot, services, q, message.id, chat_id, task_id).await
     } else if let Some((task_id, format_id)) = parse_task_callback(&data) {
+        debug!(task_id = %task_id, format_id = %format_id, "Routing to format selection handler");
         handle_format_selection(&bot, services, q, message.id, chat_id, task_id, format_id).await
     } else if let Some((task_id, target_ext)) = parse_target_callback(&data) {
+        debug!(task_id = %task_id, target_ext = %target_ext, "Routing to target selection handler");
         handle_target_selection(&bot, services, q, message.id, chat_id, task_id, target_ext).await
     } else {
+        warn!(callback_data = %data, "Unknown callback data format");
         Ok(())
     }
 }
 
+#[instrument(skip(bot, services, q), fields(task_id = %task_id, format_id = %format_id, chat_id = %chat_id))]
 async fn handle_format_selection(
     bot: &Bot,
     services: AppServices,
@@ -397,7 +465,10 @@ async fn handle_format_selection(
     task_id: TaskId,
     format_id: String,
 ) -> Result<(), AppError> {
+    info!(task_id = %task_id, format_id = %format_id, "Processing format selection");
+
     let Some(task) = services.state.tasks.get(&task_id) else {
+        warn!(task_id = %task_id, "Task not found or expired");
         bot.edit_message_text(chat_id, message_id, "Task expired. Try again.")
             .await?;
         return Ok(());
@@ -435,8 +506,12 @@ async fn handle_format_selection(
     };
 
     let (title, selection, targets) = match selection_result {
-        Ok(data) => data,
+        Ok(data) => {
+            info!(task_id = %task_id, format_id = %format_id, target_count = data.2.len(), "Format selection successful");
+            data
+        }
         Err(error_message) => {
+            warn!(task_id = %task_id, error = error_message, "Format selection failed");
             bot.edit_message_text(chat_id, message_id, error_message)
                 .await?;
             return Ok(());
@@ -446,6 +521,7 @@ async fn handle_format_selection(
     bot.answer_callback_query(q.id).await?;
 
     if targets.is_empty() {
+        warn!(task_id = %task_id, "No output formats available for selected format");
         bot.edit_message_text(chat_id, message_id, "No output formats found.")
             .await?;
         return Ok(());
@@ -471,6 +547,7 @@ async fn handle_format_selection(
         text = format!("Select an output format for:\n{title}");
     }
 
+    debug!(task_id = %task_id, "Displaying target format selection keyboard");
     bot.edit_message_text(chat_id, message_id, text)
         .reply_markup(keyboard)
         .await?;
@@ -478,13 +555,15 @@ async fn handle_format_selection(
     spawn_target_selection_timeout(
         bot.clone(),
         services.state.tasks.clone(),
-        task_id,
+        task_id.clone(),
         chat_id,
         message_id,
     );
+    info!(task_id = %task_id, "Target format selection displayed successfully");
     Ok(())
 }
 
+#[instrument(skip(bot, services, q), fields(task_id = %task_id, target_ext = %target_ext, chat_id = %chat_id))]
 async fn handle_target_selection(
     bot: &Bot,
     services: AppServices,
@@ -494,7 +573,10 @@ async fn handle_target_selection(
     task_id: TaskId,
     target_ext: String,
 ) -> Result<(), AppError> {
+    info!(task_id = %task_id, target_ext = %target_ext, "Processing target format selection");
+
     let Some(task) = services.state.tasks.get(&task_id) else {
+        warn!(task_id = %task_id, "Task not found or expired");
         bot.edit_message_text(chat_id, message_id, "Task expired. Try again.")
             .await?;
         return Ok(());
@@ -532,8 +614,12 @@ async fn handle_target_selection(
     };
 
     let (url, title, author, selection, target, cancel) = match selection_result {
-        Ok(data) => data,
+        Ok(data) => {
+            info!(task_id = %task_id, target_ext = %target_ext, "Target selection successful, queueing download");
+            data
+        }
         Err(error_message) => {
+            warn!(task_id = %task_id, error = error_message, "Target selection failed");
             bot.edit_message_text(chat_id, message_id, error_message)
                 .await?;
             return Ok(());
@@ -548,7 +634,7 @@ async fn handle_target_selection(
     let downloader = services.downloader.clone();
     let bot_clone = bot.clone();
     let context = RunDownloadContext {
-        task_id,
+        task_id: task_id.clone(),
         chat_id,
         message_id,
         url,
@@ -558,13 +644,19 @@ async fn handle_target_selection(
         target,
         cancel,
     };
-    tokio::spawn(async move {
-        run_download_task(bot_clone, registry, downloader, context).await;
-    });
+
+    info!(task_id = %task_id, "Spawning download task");
+    tokio::spawn(
+        async move {
+            run_download_task(bot_clone, registry, downloader, context).await;
+        }
+        .in_current_span(),
+    );
 
     Ok(())
 }
 
+#[instrument(skip(bot, services, q), fields(task_id = %task_id, chat_id = %chat_id))]
 async fn handle_cancel_task(
     bot: &Bot,
     services: AppServices,
@@ -573,7 +665,10 @@ async fn handle_cancel_task(
     chat_id: ChatId,
     task_id: TaskId,
 ) -> Result<(), AppError> {
+    info!(task_id = %task_id, "Processing task cancellation request");
+
     let Some(task) = services.state.tasks.get(&task_id) else {
+        warn!(task_id = %task_id, "Task not found or already expired");
         bot.edit_message_text(chat_id, message_id, "Task expired. Try again.")
             .await?;
         return Ok(());
@@ -584,8 +679,10 @@ async fn handle_cancel_task(
     {
         let mut task = task.lock().await;
         if task.message_id != message_id || task.chat_id != chat_id {
+            warn!(task_id = %task_id, "Task metadata mismatch during cancellation");
             mismatch = true;
         } else {
+            debug!(task_id = %task_id, "Setting cancellation flag");
             task.cancel.store(true, Ordering::SeqCst);
             remove_now = matches!(
                 task.state,
@@ -598,6 +695,7 @@ async fn handle_cancel_task(
     }
 
     if mismatch {
+        warn!(task_id = %task_id, "Rejecting cancellation due to mismatch");
         bot.edit_message_text(chat_id, message_id, "Task mismatch. Try again.")
             .await?;
         return Ok(());
@@ -605,14 +703,23 @@ async fn handle_cancel_task(
 
     bot.answer_callback_query(q.id).await?;
     if remove_now {
+        debug!(task_id = %task_id, "Removing task immediately (not yet running)");
         let _ = services.state.tasks.remove(&task_id);
     }
     let _ = bot
         .edit_message_text(chat_id, message_id, "Cancelled.")
         .await;
+    info!(task_id = %task_id, "Task cancelled successfully");
     Ok(())
 }
 
+#[instrument(skip(bot, registry, downloader, context), fields(
+    task_id = %context.task_id,
+    chat_id = %context.chat_id,
+    url = %context.url,
+    format_id = %context.selection.format_id,
+    target_ext = %context.target.ext
+))]
 async fn run_download_task(
     bot: Bot,
     registry: TaskRegistry,
@@ -630,13 +737,18 @@ async fn run_download_task(
         target,
         cancel,
     } = context;
+
+    info!(task_id = %task_id, "Download task started");
     let _guard = registry.guard(task_id.clone());
+
     if is_cancelled(&cancel) {
+        warn!(task_id = %task_id, "Task cancelled before download started");
         let _ = bot
             .edit_message_text(chat_id, message_id, "Cancelled.")
             .await;
         return;
     }
+    debug!(task_id = %task_id, "Setting task state to Downloading");
     set_task_state(
         &registry,
         &task_id,
@@ -649,6 +761,7 @@ async fn run_download_task(
 
     let progress = ProgressState::new();
     let cancel_keyboard = cancel_keyboard(&task_id);
+    debug!(task_id = %task_id, "Updating UI for download phase");
     let _ = bot
         .edit_message_text(chat_id, message_id, "Downloading…")
         .reply_markup(cancel_keyboard.clone())
@@ -664,6 +777,7 @@ async fn run_download_task(
         keyboard: cancel_keyboard.clone(),
     });
 
+    info!(task_id = %task_id, format_id = %selection.format_id, "Starting download");
     let result = downloader
         .download(DownloadRequest {
             url,
@@ -677,8 +791,15 @@ async fn run_download_task(
     let _ = progress_task.await;
 
     let download_result = match result {
-        Ok(result) => result,
+        Ok(result) => {
+            info!(task_id = %task_id, result_type = match &result {
+                DownloadResult::InMemory { data } => format!("in-memory ({} bytes)", data.len()),
+                DownloadResult::TempFile { path } => format!("temp-file ({})", path.display()),
+            }, "Download completed successfully");
+            result
+        }
         Err(AppError::Cancelled) => {
+            warn!(task_id = %task_id, "Download cancelled by user");
             set_task_state(
                 &registry,
                 &task_id,
@@ -693,6 +814,7 @@ async fn run_download_task(
             return;
         }
         Err(err) => {
+            error!(task_id = %task_id, error = %err, "Download failed");
             let err_text = err.to_string();
             let _ = report_user_error(&bot, chat_id, message_id, "Download failed.", &err).await;
             set_task_state(
@@ -735,7 +857,14 @@ async fn run_download_task(
         .map(|ext| !ext.eq_ignore_ascii_case(&target.ext))
         .unwrap_or(true);
 
+    if needs_conversion {
+        info!(task_id = %task_id, source_ext = ?selection.ext, target_ext = %target.ext, "Conversion required");
+    } else {
+        info!(task_id = %task_id, ext = %target.ext, "No conversion required, uploading directly");
+    }
+
     let upload_result = if needs_conversion {
+        debug!(task_id = %task_id, "Setting task state to Converting");
         set_task_state(
             &registry,
             &task_id,
@@ -789,6 +918,7 @@ async fn run_download_task(
             keyboard: cancel_keyboard.clone(),
         });
         let target_kind = target_kind_from_ext(selection.kind, &target.ext);
+        info!(task_id = %task_id, input_path = %input_path.display(), output_path = %output_path.display(), "Starting ffmpeg conversion");
         let convert_result = convert_with_ffmpeg(
             &input_path,
             &output_path,
@@ -802,6 +932,7 @@ async fn run_download_task(
 
         if let Err(err) = convert_result {
             if matches!(err, AppError::Cancelled) {
+                warn!(task_id = %task_id, "Conversion cancelled by user");
                 set_task_state(
                     &registry,
                     &task_id,
@@ -816,6 +947,7 @@ async fn run_download_task(
                 cleanup_paths_cleanup(cleanup_paths).await;
                 return;
             }
+            error!(task_id = %task_id, error = %err, "Conversion failed");
             let err_text = err.to_string();
             let _ = report_user_error(&bot, chat_id, message_id, "Conversion failed.", &err).await;
             set_task_state(
@@ -829,7 +961,9 @@ async fn run_download_task(
             cleanup_paths_cleanup(cleanup_paths).await;
             return;
         }
+        info!(task_id = %task_id, "Conversion completed successfully");
 
+        debug!(task_id = %task_id, "Setting task state to Uploading");
         set_task_state(
             &registry,
             &task_id,
@@ -840,6 +974,7 @@ async fn run_download_task(
         )
         .await;
         if is_cancelled(&cancel) {
+            warn!(task_id = %task_id, "Task cancelled before upload");
             let _ = bot
                 .edit_message_text(chat_id, message_id, "Cancelled.")
                 .await;
@@ -858,6 +993,7 @@ async fn run_download_task(
             .edit_message_text(chat_id, message_id, "Uploading…")
             .await
         {
+            error!(task_id = %task_id, error = %err, "Failed to update status message");
             let _ =
                 report_user_error(&bot, chat_id, message_id, "Failed to update status.", err).await;
             cleanup_paths_cleanup(cleanup_paths).await;
@@ -866,6 +1002,7 @@ async fn run_download_task(
 
         let path_for_upload = output_path.clone();
         let filename_for_upload = output_filename.clone();
+        info!(task_id = %task_id, filename = %filename_for_upload, "Starting upload (converted file)");
         let result = upload_with_progress(&bot, chat_id, message_id, move || {
             InputFile::file(path_for_upload.clone()).file_name(filename_for_upload.clone())
         })
@@ -873,6 +1010,7 @@ async fn run_download_task(
         cleanup_paths_cleanup(cleanup_paths).await;
         result
     } else {
+        debug!(task_id = %task_id, "Setting task state to Uploading (no conversion)");
         set_task_state(
             &registry,
             &task_id,
@@ -883,6 +1021,7 @@ async fn run_download_task(
         )
         .await;
         if is_cancelled(&cancel) {
+            warn!(task_id = %task_id, "Task cancelled before upload");
             let _ = bot
                 .edit_message_text(chat_id, message_id, "Cancelled.")
                 .await;
@@ -906,6 +1045,7 @@ async fn run_download_task(
         }
         match download_result {
             DownloadResult::InMemory { data } => {
+                info!(task_id = %task_id, size_bytes = data.len(), "Uploading from memory");
                 let data = bytes::Bytes::from(data);
                 let filename = output_filename.clone();
                 upload_with_progress(&bot, chat_id, message_id, move || {
@@ -914,12 +1054,14 @@ async fn run_download_task(
                 .await
             }
             DownloadResult::TempFile { path } => {
+                info!(task_id = %task_id, path = %path.display(), "Uploading from temp file");
                 let path_for_upload = path.clone();
                 let filename_for_upload = output_filename.clone();
                 let result = upload_with_progress(&bot, chat_id, message_id, move || {
                     InputFile::file(path_for_upload.clone()).file_name(filename_for_upload.clone())
                 })
                 .await;
+                debug!(task_id = %task_id, "Cleaning up temp file");
                 let _ = tokio::fs::remove_file(path).await;
                 result
             }
@@ -928,7 +1070,9 @@ async fn run_download_task(
 
     match upload_result {
         Ok(()) => {
+            info!(task_id = %task_id, "Upload completed successfully");
             if let Err(err) = bot.edit_message_text(chat_id, message_id, "Done.").await {
+                error!(task_id = %task_id, error = %err, "Failed to send completion message");
                 let err_text = err.to_string();
                 let _ =
                     report_user_error(&bot, chat_id, message_id, "Failed to update status.", &err)
@@ -951,8 +1095,10 @@ async fn run_download_task(
                 },
             )
             .await;
+            info!(task_id = %task_id, "Task completed successfully");
         }
         Err(err) => {
+            error!(task_id = %task_id, error = %err, "Upload failed");
             let err_text = err.to_string();
             let _ = report_user_error(&bot, chat_id, message_id, "Upload failed.", &err).await;
             set_task_state(
@@ -974,6 +1120,7 @@ async fn set_task_state(registry: &TaskRegistry, task_id: &TaskId, state: TaskSt
     }
 }
 
+#[instrument(skip(bot, make_file), fields(chat_id = %chat_id))]
 async fn upload_with_progress<F>(
     bot: &Bot,
     chat_id: ChatId,
@@ -983,39 +1130,43 @@ async fn upload_with_progress<F>(
 where
     F: Fn() -> InputFile,
 {
+    debug!("Starting upload with progress tracking");
     let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
     let bot_clone = bot.clone();
     let started_at = time::Instant::now();
-    let progress_task = tokio::spawn(async move {
-        let mut ticker = time::interval(PROGRESS_UPDATE_EVERY);
-        let mut last_text: Option<String> = None;
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    let elapsed = started_at.elapsed().as_secs();
-                    let text = format!("Uploading… {}s elapsed", elapsed);
-                    if last_text.as_deref() == Some(text.as_str()) {
-                        continue;
-                    }
-                    match bot_clone.edit_message_text(chat_id, message_id, text.clone()).await {
-                        Ok(_) => {
-                            last_text = Some(text);
+    let progress_task = tokio::spawn(
+        async move {
+            let mut ticker = time::interval(PROGRESS_UPDATE_EVERY);
+            let mut last_text: Option<String> = None;
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let elapsed = started_at.elapsed().as_secs();
+                        let text = format!("Uploading… {}s elapsed", elapsed);
+                        if last_text.as_deref() == Some(text.as_str()) {
+                            continue;
                         }
-                        Err(err) => {
-                            if is_message_not_modified(&err) {
+                        match bot_clone.edit_message_text(chat_id, message_id, text.clone()).await {
+                            Ok(_) => {
                                 last_text = Some(text);
-                                continue;
                             }
-                            tracing::warn!("Failed to edit upload progress message: {err}");
+                            Err(err) => {
+                                if is_message_not_modified(&err) {
+                                    last_text = Some(text);
+                                    continue;
+                                }
+                                tracing::warn!("Failed to edit upload progress message: {err}");
+                            }
                         }
                     }
-                }
-                _ = done_rx.changed() => {
-                    break;
+                    _ = done_rx.changed() => {
+                        break;
+                    }
                 }
             }
         }
-    });
+        .in_current_span(),
+    );
 
     let result = send_document_with_retry(bot, chat_id, make_file).await;
     let _ = done_tx.send(true);
@@ -1093,13 +1244,17 @@ fn spawn_waiting_format_timeout(
     chat_id: ChatId,
     message_id: MessageId,
 ) {
-    tokio::spawn(async move {
-        time::sleep(SELECTION_TIMEOUT).await;
-        expire_task_if_state(&bot, &registry, &task_id, chat_id, message_id, |state| {
-            matches!(state, TaskState::WaitingFormat { .. })
-        })
-        .await;
-    });
+    debug!(task_id = %task_id, timeout_secs = SELECTION_TIMEOUT.as_secs(), "Spawning format selection timeout task");
+    tokio::spawn(
+        async move {
+            time::sleep(SELECTION_TIMEOUT).await;
+            expire_task_if_state(&bot, &registry, &task_id, chat_id, message_id, |state| {
+                matches!(state, TaskState::WaitingFormat { .. })
+            })
+            .await;
+        }
+        .in_current_span(),
+    );
 }
 
 fn spawn_target_selection_timeout(
@@ -1109,15 +1264,20 @@ fn spawn_target_selection_timeout(
     chat_id: ChatId,
     message_id: MessageId,
 ) {
-    tokio::spawn(async move {
-        time::sleep(SELECTION_TIMEOUT).await;
-        expire_task_if_state(&bot, &registry, &task_id, chat_id, message_id, |state| {
-            matches!(state, TaskState::SelectingTarget { .. })
-        })
-        .await;
-    });
+    debug!(task_id = %task_id, timeout_secs = SELECTION_TIMEOUT.as_secs(), "Spawning target selection timeout task");
+    tokio::spawn(
+        async move {
+            time::sleep(SELECTION_TIMEOUT).await;
+            expire_task_if_state(&bot, &registry, &task_id, chat_id, message_id, |state| {
+                matches!(state, TaskState::SelectingTarget { .. })
+            })
+            .await;
+        }
+        .in_current_span(),
+    );
 }
 
+#[instrument(skip(bot, registry, matches_state), fields(task_id = %task_id, chat_id = %chat_id))]
 async fn expire_task_if_state(
     bot: &Bot,
     registry: &TaskRegistry,
@@ -1126,20 +1286,26 @@ async fn expire_task_if_state(
     message_id: MessageId,
     matches_state: impl FnOnce(&TaskState) -> bool,
 ) {
+    debug!(task_id = %task_id, "Checking if task should expire");
+
     let Some(task) = registry.get(task_id) else {
+        debug!(task_id = %task_id, "Task already removed, skipping expiration");
         return;
     };
 
     let should_expire = {
         let mut task = task.lock().await;
         if task.message_id != message_id || task.chat_id != chat_id {
+            debug!(task_id = %task_id, "Task metadata mismatch, not expiring");
             false
         } else if matches_state(&task.state) {
+            warn!(task_id = %task_id, "Task selection timed out");
             task.state = TaskState::Finished {
                 outcome: TaskOutcome::Failed("Selection timed out".to_string()),
             };
             true
         } else {
+            debug!(task_id = %task_id, "Task state doesn't match expiration criteria");
             false
         }
     };
@@ -1148,6 +1314,7 @@ async fn expire_task_if_state(
         return;
     }
 
+    debug!(task_id = %task_id, "Removing expired task");
     let _ = registry.remove(task_id);
     let _ = bot
         .edit_message_text(
@@ -1156,6 +1323,7 @@ async fn expire_task_if_state(
             "Selection timed out. Send the link again.",
         )
         .await;
+    info!(task_id = %task_id, "Task expired due to timeout");
 }
 
 struct ProgressTaskContext {
@@ -1185,55 +1353,60 @@ fn spawn_progress_task(
         cancel,
         keyboard,
     } = context;
+
+    debug!(phase = phase, chat_id = %chat_id, "Spawning progress update task");
     let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
     let bot_clone = bot.clone();
     let progress_clone = progress.clone();
     let progress_title = title.clone();
     let phase_label = phase.to_string();
     let keyboard = keyboard.clone();
-    let progress_task = tokio::spawn(async move {
-        let mut ticker = time::interval(PROGRESS_UPDATE_EVERY);
-        let mut notified = false;
-        let mut last_text: Option<String> = None;
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    if is_cancelled(&cancel) {
+    let progress_task = tokio::spawn(
+        async move {
+            let mut ticker = time::interval(PROGRESS_UPDATE_EVERY);
+            let mut notified = false;
+            let mut last_text: Option<String> = None;
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        if is_cancelled(&cancel) {
+                            break;
+                        }
+                        let text = progress_clone.build_text(&phase_label, &progress_title).await;
+                        if last_text.as_deref() == Some(text.as_str()) {
+                            continue;
+                        }
+                        match bot_clone
+                            .edit_message_text(chat_id, message_id, text.clone())
+                            .reply_markup(keyboard.clone())
+                            .await
+                        {
+                            Ok(_) => {
+                                last_text = Some(text);
+                            }
+                            Err(err) => {
+                                if is_message_not_modified(&err) {
+                                    last_text = Some(text);
+                                    continue;
+                                }
+                                tracing::warn!("Failed to edit progress message: {err}");
+                                if !notified {
+                                    let _ = bot_clone
+                                        .send_message(chat_id, format!("Progress update failed.\nError: {err}"))
+                                        .await;
+                                    notified = true;
+                                }
+                            }
+                        }
+                    }
+                    _ = done_rx.changed() => {
                         break;
                     }
-                    let text = progress_clone.build_text(&phase_label, &progress_title).await;
-                    if last_text.as_deref() == Some(text.as_str()) {
-                        continue;
-                    }
-                    match bot_clone
-                        .edit_message_text(chat_id, message_id, text.clone())
-                        .reply_markup(keyboard.clone())
-                        .await
-                    {
-                        Ok(_) => {
-                            last_text = Some(text);
-                        }
-                        Err(err) => {
-                            if is_message_not_modified(&err) {
-                                last_text = Some(text);
-                                continue;
-                            }
-                            tracing::warn!("Failed to edit progress message: {err}");
-                            if !notified {
-                                let _ = bot_clone
-                                    .send_message(chat_id, format!("Progress update failed.\nError: {err}"))
-                                    .await;
-                                notified = true;
-                            }
-                        }
-                    }
-                }
-                _ = done_rx.changed() => {
-                    break;
                 }
             }
         }
-    });
+        .in_current_span(),
+    );
     (done_tx, progress_task)
 }
 
