@@ -26,6 +26,9 @@ pub enum AppError {
     #[error("ffmpeg failed with exit code: {0}")]
     FfmpegFailed(std::process::ExitStatus),
 
+    #[error("ffmpeg failed with exit code: {0}\n{1}")]
+    FfmpegFailedWithOutput(std::process::ExitStatus, String),
+
     #[error("Task cancelled")]
     Cancelled,
 

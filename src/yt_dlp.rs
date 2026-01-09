@@ -9,6 +9,7 @@ use tokio::{
     process::Command,
 };
 use std::sync::atomic::Ordering;
+use std::env;
 
 #[derive(Default)]
 pub struct YtDlpClient;
@@ -26,13 +27,9 @@ pub trait Downloader: Send + Sync {
 #[async_trait]
 impl MediaProvider for YtDlpClient {
     async fn fetch_formats(&self, url: &str) -> Result<crate::handlers::YtDlpInfo, AppError> {
-        let output = Command::new("yt-dlp")
-            .arg("-J")
-            .arg("--no-playlist")
-            .arg(url)
-            .output()
-            .await
-            .map_err(AppError::Io)?;
+        let mut cmd = yt_dlp_base_command();
+        cmd.arg("-J").arg("--no-playlist").arg(url);
+        let output = cmd.output().await.map_err(AppError::Io)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -53,7 +50,8 @@ impl Downloader for YtDlpClient {
 }
 
 async fn download_with_progress(req: DownloadRequest) -> Result<DownloadResult, AppError> {
-    let mut child = Command::new("yt-dlp")
+    let mut cmd = yt_dlp_base_command();
+    let mut child = cmd
         .arg("-f")
         .arg(&req.format_id)
         .arg("-o")
@@ -142,4 +140,22 @@ async fn download_with_progress(req: DownloadRequest) -> Result<DownloadResult, 
             data: buffer.to_vec(),
         })
     }
+}
+
+fn yt_dlp_base_command() -> Command {
+    let mut cmd = Command::new("yt-dlp");
+    let player_client = env::var("YTDLP_PLAYER_CLIENT").unwrap_or_else(|_| "android".to_string());
+    cmd.arg("--extractor-args")
+        .arg(format!("youtube:player_client={player_client}"));
+
+    if matches!(
+        env::var("YTDLP_FORCE_IPV4")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    ) {
+        cmd.arg("--force-ipv4");
+    }
+
+    cmd
 }

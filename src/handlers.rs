@@ -1145,6 +1145,72 @@ where
     Ok(())
 }
 
+async fn stream_process_output_with_capture<R>(
+    reader: R,
+    progress: ProgressState,
+    max_bytes: usize,
+) -> Result<String, AppError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut reader = tokio::io::BufReader::new(reader);
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let mut captured = String::new();
+
+    loop {
+        let read = reader.read(&mut chunk).await.map_err(AppError::Io)?;
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        while let Some(pos) = buffer.iter().position(|&b| b == b'\n' || b == b'\r') {
+            let mut line = buffer.drain(..=pos).collect::<Vec<u8>>();
+            while matches!(line.last(), Some(b'\n' | b'\r')) {
+                line.pop();
+            }
+            let line = String::from_utf8_lossy(&line).to_string();
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            progress.push_line(trimmed.to_string()).await;
+            if captured.len() < max_bytes {
+                if !captured.is_empty() {
+                    captured.push('\n');
+                }
+                let remaining = max_bytes - captured.len();
+                if trimmed.len() <= remaining {
+                    captured.push_str(trimmed);
+                } else if remaining > 0 {
+                    captured.push_str(&trimmed[..remaining]);
+                }
+            }
+        }
+    }
+
+    if !buffer.is_empty() {
+        let line = String::from_utf8_lossy(&buffer).to_string();
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            progress.push_line(trimmed.to_string()).await;
+            if captured.len() < max_bytes {
+                if !captured.is_empty() {
+                    captured.push('\n');
+                }
+                let remaining = max_bytes - captured.len();
+                if trimmed.len() <= remaining {
+                    captured.push_str(trimmed);
+                } else if remaining > 0 {
+                    captured.push_str(&trimmed[..remaining]);
+                }
+            }
+        }
+    }
+
+    Ok(captured)
+}
+
 async fn convert_with_ffmpeg(
     input: &Path,
     output: &Path,
@@ -1177,7 +1243,7 @@ async fn convert_with_ffmpeg(
         .ok_or_else(|| AppError::MissingOutput("ffmpeg stderr".into()))?;
 
     let stdout_task = tokio::spawn(stream_process_output(stdout, progress.clone()));
-    let stderr_task = tokio::spawn(stream_process_output(stderr, progress));
+    let stderr_task = tokio::spawn(stream_process_output_with_capture(stderr, progress, 16 * 1024));
 
     let status = loop {
         tokio::select! {
@@ -1199,10 +1265,14 @@ async fn convert_with_ffmpeg(
     let stderr_result = stderr_task.await?;
 
     stdout_result?;
-    stderr_result?;
+    let stderr_text = stderr_result?;
 
     if !status.success() {
-        return Err(AppError::FfmpegFailed(status));
+        let trimmed = stderr_text.trim();
+        if trimmed.is_empty() {
+            return Err(AppError::FfmpegFailed(status));
+        }
+        return Err(AppError::FfmpegFailedWithOutput(status, trimmed.to_string()));
     }
     Ok(())
 }
