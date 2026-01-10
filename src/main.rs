@@ -12,7 +12,6 @@ use tokio::signal::unix::{SignalKind, signal};
 use tracing::{Instrument, error, info, instrument, warn};
 
 #[tokio::main]
-#[instrument]
 async fn main() -> Result<(), AppError> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
