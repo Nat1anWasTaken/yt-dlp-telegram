@@ -14,6 +14,10 @@ use tracing::{Instrument, error, info, instrument, warn};
 #[tokio::main]
 #[instrument]
 async fn main() -> Result<(), AppError> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     if let Err(err) = run().await {
         eprintln!("fatal error: {err}");
         error!(event = "fatal_error", error = %err);
@@ -24,10 +28,6 @@ async fn main() -> Result<(), AppError> {
 
 #[instrument]
 async fn run() -> Result<(), AppError> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
     dotenv::dotenv().ok();
     info!(event = "startup_begin");
 
